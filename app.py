@@ -39,17 +39,34 @@ st.markdown("""
 # --- 3. HISTORY FILE ---
 HISTORY_FILE = "scan_history.csv"
 
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            return pd.read_csv(HISTORY_FILE)
+        except:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
 def save_row_to_disk(row_dict):
-    """Backs up data to disk immediately."""
     df = pd.DataFrame([row_dict])
     header = not os.path.exists(HISTORY_FILE)
     df.to_csv(HISTORY_FILE, mode='a', header=header, index=False)
 
+def clear_disk_history():
+    if os.path.exists(HISTORY_FILE):
+        os.remove(HISTORY_FILE)
+
 # --- 4. STATE ---
-if 'data' not in st.session_state: st.session_state.data = pd.DataFrame()
+if 'data' not in st.session_state: st.session_state.data = load_history()
 if 'monitoring' not in st.session_state: st.session_state.monitoring = False
 if 'seen_emails' not in st.session_state: st.session_state.seen_emails = set()
 if 'last_max_id' not in st.session_state: st.session_state.last_max_id = 0
+
+# Re-populate seen cache from history
+if not st.session_state.data.empty:
+    for index, row in st.session_state.data.iterrows():
+        sig = f"{row['Sender']}_{row['Subject']}_{row['Content'][:20]}"
+        st.session_state.seen_emails.add(sig)
 
 # --- 5. HELPERS ---
 def clean_text(text):
@@ -96,7 +113,7 @@ def sort_dataframe(df):
     df = df.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
     return df
 
-# --- 6. SCANNING LOGIC (HARD BRAKE ADDED) ---
+# --- 6. SCANNING LOGIC ---
 def scan_inbox(model, server, user, password, limit, table_placeholder, metrics_placeholder, progress_bar, status_text):
     try:
         mail = imaplib.IMAP4_SSL(server, 993)
@@ -111,56 +128,47 @@ def scan_inbox(model, server, user, password, limit, table_placeholder, metrics_
             mail.logout()
             return
 
-        # Integer Sort (Newest First)
         email_ids = sorted([int(x) for x in raw_ids], reverse=True)
-        
         ids_to_process = []
 
-        # --- FILTERING LOGIC ---
+        # HIGH WATER MARK LOGIC
         if st.session_state.last_max_id == 0:
-            # First Run: Grab everything (We will limit by COUNT later)
-            ids_to_process = email_ids
+            ids_to_process = email_ids # Get all, we filter by count below
         else:
-            # Subsequent Runs: Only grab IDs strictly newer than before
             ids_to_process = [x for x in email_ids if x > st.session_state.last_max_id]
-            
+        
         if not ids_to_process:
             status_text.text(f"Monitoring... (Up to date)")
             mail.logout()
             return
 
-        # --- UI UPDATES ---
-        # If it's the first run, total = limit. If live update, total = real count.
-        display_total = limit if st.session_state.last_max_id == 0 else len(ids_to_process)
-        status_text.markdown(f"**Found new emails.** Scanning top {display_total}...")
-        
         label_map = {0: "Low", 1: "Medium", 2: "High"}
+        emails_processed = 0
         
-        # COUNTER FOR HARD STOP
-        emails_processed_this_batch = 0
+        # Initial Display Total (for progress bar)
+        total_to_scan = limit if st.session_state.last_max_id == 0 else len(ids_to_process)
+        status_text.markdown(f"**Found new emails.** Scanning...")
 
         for i, e_id_int in enumerate(ids_to_process):
-            
-            # --- THE HARD BRAKE ---
-            # Only enforce limit on the FIRST run (Backlog Scan)
-            # On subsequent runs (Live), we want to scan ALL new emails.
-            if st.session_state.last_max_id == 0 and emails_processed_this_batch >= limit:
-                # Save the high water mark so we don't scan these again
+            # HARD STOP logic for Initial Scan
+            if st.session_state.last_max_id == 0 and emails_processed >= limit:
+                # Set watermark to the highest ID we successfully grabbed
                 st.session_state.last_max_id = max(ids_to_process[:limit])
                 break
             
-            # Update watermark dynamically
+            # Update watermark dynamically for live mode
             if e_id_int > st.session_state.last_max_id:
                 st.session_state.last_max_id = e_id_int
 
             try:
-                e_id = str(e_id_int)
-                
-                # Progress Bar
-                prog = min((emails_processed_this_batch + 1) / display_total, 1.0)
+                # Update Progress
+                prog = min((emails_processed + 1) / total_to_scan, 1.0)
                 progress_bar.progress(prog)
                 
+                e_id = str(e_id_int)
                 _, msg_data = mail.fetch(e_id, "(RFC822)")
+                
+                success = False
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
                         msg = email.message_from_bytes(response_part[1])
@@ -171,7 +179,7 @@ def scan_inbox(model, server, user, password, limit, table_placeholder, metrics_
                         c_s, c_sub, c_b = clean_text(snd), clean_text(sub), clean_text(bod)
                         tok_str = " ".join(toks)
                         
-                        # Deduplication based on content signature
+                        # Dedupe by signature
                         sig = f"{c_s}_{c_sub}_{c_b[:20]}"
                         if sig in st.session_state.seen_emails:
                             continue
@@ -192,21 +200,22 @@ def scan_inbox(model, server, user, password, limit, table_placeholder, metrics_
                             "Content": c_b[:500]
                         }
                         
-                        # Success! Add to data.
                         save_row_to_disk(new_row)
                         
                         new_df = pd.DataFrame([new_row])
                         st.session_state.data = pd.concat([new_df, st.session_state.data], ignore_index=True)
                         st.session_state.data = sort_dataframe(st.session_state.data)
                         
-                        emails_processed_this_batch += 1
-                        
                         with table_placeholder.container():
-                            # Hide content column for display
                             display_df = st.session_state.data.drop(columns=['Content'], errors='ignore')
                             render_table(display_df)
                         with metrics_placeholder.container():
                             render_metrics(st.session_state.data)
+                            
+                        success = True
+
+                if success:
+                    emails_processed += 1
 
             except Exception:
                 continue
@@ -245,10 +254,12 @@ def render_table(df):
 with st.sidebar:
     st.title("🧠 NeuroMail Live")
     
+    # Auto-Load Logic
     model_path = "email_model.pkl"
     uploaded_file = None
+    
     if os.path.exists(model_path):
-        st.success("✅ Brain Detected")
+        st.success("✅ Brain Detected on Server")
         uploaded_file = model_path
     else:
         uploaded_file = st.file_uploader("Upload Model", type="pkl")
@@ -259,7 +270,6 @@ with st.sidebar:
         email_pass = st.text_input("App Password", type="password")
     
     st.markdown("---")
-    # This controls the FIRST run
     backlog_limit = st.number_input("Initial Scan Limit", min_value=10, max_value=1000, value=50)
     
     col1, col2 = st.columns(2)
@@ -271,23 +281,20 @@ with st.sidebar:
         if st.button("🟢 START"):
             if email_user and email_pass:
                 st.session_state.monitoring = True
-                
-                # --- CLEAR SCREEN BUT KEEP HISTORY FILE ---
-                st.session_state.data = pd.DataFrame()
-                st.session_state.seen_emails = set()
-                st.session_state.last_max_id = 0
-                
+                # Note: We do NOT clear history here, allowing it to resume from disk
                 st.rerun()
             else:
                 st.error("Missing Info")
     
-    if not st.session_state.data.empty:
-        csv = st.session_state.data.to_csv(index=False).encode('utf-8')
-        st.download_button("💾 Download Report", data=csv, file_name="email_report.csv", mime="text/csv", use_container_width=True)
+    # Download Button
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "rb") as f:
+            st.download_button("💾 Download Report", f, file_name="email_report.csv", mime="text/csv")
     
-    # HISTORY MANAGEMENT
     if st.button("Clear History"):
+        clear_disk_history()
         st.session_state.data = pd.DataFrame()
+        st.session_state.seen_emails = set()
         st.rerun()
 
 # --- 8. MAIN ---
@@ -299,14 +306,16 @@ render_metrics(st.session_state.data)
 st.divider()
 
 status_text = st.empty()
+progress_bar = st.empty()
 table_placeholder = st.empty()
 
 if not st.session_state.data.empty:
     with table_placeholder.container():
+        # Hide content column
         display_df = st.session_state.data.drop(columns=['Content'], errors='ignore')
         render_table(display_df)
 else:
-    table_placeholder.info("Ready to scan.")
+    table_placeholder.info("History empty. Waiting for scan...")
 
 # --- 9. LOOP ---
 if st.session_state.monitoring:
@@ -318,8 +327,9 @@ if st.session_state.monitoring:
         else:
             model = joblib.load(uploaded_file)
             
+        # FIXED: Added status_text to the call
         scan_inbox(model, imap_server, email_user, email_pass, backlog_limit, 
-                   table_placeholder, metrics_placeholder, status_text)
+                   table_placeholder, metrics_placeholder, progress_bar, status_text)
     except Exception as e:
         st.error(f"Init Error: {e}")
         st.session_state.monitoring = False
