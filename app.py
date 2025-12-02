@@ -36,49 +36,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. PERSISTENCE SYSTEM (The Crash Proofing) ---
-HISTORY_FILE = "scan_history.csv"
-
-def load_history():
-    """Loads previous data from disk to recover from crashes."""
-    if os.path.exists(HISTORY_FILE):
-        try:
-            df = pd.read_csv(HISTORY_FILE)
-            return df
-        except:
-            return pd.DataFrame()
-    return pd.DataFrame()
-
-def save_row_to_disk(row_dict):
-    """Saves a single row instantly to the CSV file."""
-    df = pd.DataFrame([row_dict])
-    # If file doesn't exist, write header. If it does, append without header.
-    header = not os.path.exists(HISTORY_FILE)
-    df.to_csv(HISTORY_FILE, mode='a', header=header, index=False)
-
-def clear_disk_history():
-    """Deletes the physical file."""
-    if os.path.exists(HISTORY_FILE):
-        os.remove(HISTORY_FILE)
-
-# --- 4. STATE INITIALIZATION ---
-if 'data' not in st.session_state:
-    # On startup, try to load history from the file
-    st.session_state.data = load_history()
-    
+# --- 3. STATE MANAGEMENT ---
+if 'data' not in st.session_state: st.session_state.data = pd.DataFrame()
 if 'monitoring' not in st.session_state: st.session_state.monitoring = False
 if 'seen_emails' not in st.session_state: st.session_state.seen_emails = set()
 if 'last_max_id' not in st.session_state: st.session_state.last_max_id = 0
 
-# Re-populate 'seen_emails' from loaded history to prevent duplicates after a crash
-if not st.session_state.data.empty:
-    # We create a unique signature for seen emails since we don't save IDs to CSV
-    # Signature: Sender + Subject + Time
-    for index, row in st.session_state.data.iterrows():
-        sig = f"{row['Sender']}_{row['Subject']}_{row['Time']}"
-        st.session_state.seen_emails.add(sig)
-
-# --- 5. HELPER FUNCTIONS ---
+# --- 4. HELPER FUNCTIONS ---
 def clean_text(text):
     if text is None: return ""
     if isinstance(text, bytes): text = text.decode(errors='ignore')
@@ -123,7 +87,7 @@ def sort_dataframe(df):
     df = df.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
     return df
 
-# --- 6. SCANNING LOGIC ---
+# --- 5. SCANNING LOGIC (Strict Top-Down) ---
 def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, metrics_placeholder, status_text):
     try:
         mail = imaplib.IMAP4_SSL(server, 993)
@@ -138,31 +102,41 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
             mail.logout()
             return
 
+        # --- CRITICAL FIX: INTEGER SORTING ---
+        # Ensure we actually get the mathematically highest numbers (Newest)
         email_ids = sorted([int(x) for x in raw_ids], reverse=True)
+        
+        # Filter Logic
         ids_to_process = []
 
-        # High Water Mark Logic
         if st.session_state.last_max_id == 0:
-            ids_to_process = email_ids[:backlog_limit]
-            if ids_to_process:
-                st.session_state.last_max_id = max(ids_to_process)
+            # First Run: Just grab the whole list. We will stop when we hit the count limit later.
+            ids_to_process = email_ids
         else:
+            # Subsequent Runs: Only new stuff
             ids_to_process = [x for x in email_ids if x > st.session_state.last_max_id]
-            if ids_to_process:
-                st.session_state.last_max_id = max(ids_to_process)
         
         if not ids_to_process:
             status_text.text(f"Monitoring... (Up to date)")
             mail.logout()
             return
 
-        status_text.markdown(f"**Found {len(ids_to_process)} new emails.** Sorting and Processing...")
+        status_text.markdown(f"**Found {len(ids_to_process)} potential emails.** Scanning top {backlog_limit}...")
+        
         label_map = {0: "Low", 1: "Medium", 2: "High"}
+        emails_collected = 0 # Track valid scans
 
-        for i, e_id_int in enumerate(ids_to_process):
+        for e_id_int in ids_to_process:
+            # STOP CONDITION: Strictly obey the user limit
+            if st.session_state.last_max_id == 0 and emails_collected >= backlog_limit:
+                break
+
             try:
                 e_id = str(e_id_int)
                 _, msg_data = mail.fetch(e_id, "(RFC822)")
+                
+                processed_successfully = False
+                
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
                         msg = email.message_from_bytes(response_part[1])
@@ -173,22 +147,19 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                         c_s, c_sub, c_b = clean_text(snd), clean_text(sub), clean_text(bod)
                         tok_str = " ".join(toks)
                         
-                        # Deduplication Check (Using Signature because IDs change between sessions)
-                        current_time = datetime.datetime.now().strftime("%H:%M")
-                        sig = f"{c_s}_{c_sub}_{current_time}"
-                        
+                        # Check Duplicates in UI
+                        sig = f"{c_s}_{c_sub}_{bod[:20]}" # Use content signature
                         if sig in st.session_state.seen_emails:
                             continue
-                        
                         st.session_state.seen_emails.add(sig)
 
-                        # AI Prediction
+                        # Predict
                         full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b}"
                         pred = model.predict([full_input])[0]
                         prob = max(model.predict_proba([full_input])[0])
                         
                         new_row = {
-                            "Time": current_time,
+                            "Time": datetime.datetime.now().strftime("%H:%M"),
                             "Priority": label_map.get(pred, "Unknown"),
                             "Confidence": prob,
                             "Sender": c_s,
@@ -196,10 +167,6 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                             "Tokens": toks
                         }
                         
-                        # 1. SAVE TO DISK (The Safety Net)
-                        save_row_to_disk(new_row)
-
-                        # 2. UPDATE UI
                         new_df = pd.DataFrame([new_row])
                         st.session_state.data = pd.concat([new_df, st.session_state.data], ignore_index=True)
                         st.session_state.data = sort_dataframe(st.session_state.data)
@@ -208,6 +175,16 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                             render_table(st.session_state.data)
                         with metrics_placeholder.container():
                             render_metrics(st.session_state.data)
+                        
+                        processed_successfully = True
+
+                # Only increment count if we actually added a row (skipped errors don't count)
+                if processed_successfully:
+                    emails_collected += 1
+                    # Update High Water Mark
+                    if e_id_int > st.session_state.last_max_id:
+                        st.session_state.last_max_id = e_id_int
+            
             except Exception:
                 continue
 
@@ -245,12 +222,10 @@ def render_table(df):
 with st.sidebar:
     st.title("🧠 NeuroMail Live")
     
-    # Auto-Load Logic
     model_path = "email_model.pkl"
     uploaded_file = None
-    
     if os.path.exists(model_path):
-        st.success("✅ Brain Detected on Server")
+        st.success("✅ Brain Detected")
         uploaded_file = model_path
     else:
         uploaded_file = st.file_uploader("Upload Model", type="pkl")
@@ -261,7 +236,7 @@ with st.sidebar:
         email_pass = st.text_input("App Password", type="password")
     
     st.markdown("---")
-    backlog_limit = st.number_input("Backlog Limit", min_value=10, max_value=1000, value=50)
+    backlog_limit = st.number_input("Backlog Limit", min_value=1, max_value=1000, value=50)
     
     col1, col2 = st.columns(2)
     with col1:
@@ -272,25 +247,21 @@ with st.sidebar:
         if st.button("🟢 START"):
             if email_user and email_pass:
                 st.session_state.monitoring = True
-                # Do NOT reset data here, so we keep history
+                st.session_state.seen_emails = set()
                 st.session_state.last_max_id = 0
                 st.rerun()
             else:
                 st.error("Missing Info")
     
-    # DOWNLOAD BUTTON
     if not st.session_state.data.empty:
         csv = st.session_state.data.to_csv(index=False).encode('utf-8')
         st.download_button("💾 Download Report", data=csv, file_name="email_report.csv", mime="text/csv", use_container_width=True)
     
-    # HARD RESET BUTTON
-    if st.button("🗑️ Delete All History"):
-        clear_disk_history()
+    if st.button("Clear History"):
         st.session_state.data = pd.DataFrame()
-        st.session_state.seen_emails = set()
         st.rerun()
 
-# --- 8. MAIN LAYOUT ---
+# --- 8. MAIN ---
 st.markdown("## 📡 Live Inbox Monitor")
 
 metrics_placeholder = st.empty()
@@ -305,9 +276,9 @@ if not st.session_state.data.empty:
     with table_placeholder.container():
         render_table(st.session_state.data)
 else:
-    table_placeholder.info("Waiting for scan...")
+    table_placeholder.info("Datasheet empty. Start scanning to populate.")
 
-# --- 9. LOOP ---
+# --- LOOP ---
 if st.session_state.monitoring:
     status_text.markdown('<span class="live-badge">● LIVE: Scanning...</span>', unsafe_allow_html=True)
     
