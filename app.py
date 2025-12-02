@@ -22,18 +22,14 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600&display=swap');
     .stApp { background-color: #0e1117; color: #fafafa; font-family: 'Inter', sans-serif; }
-    
-    /* Sidebar */
     section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
     
-    /* Live Badge */
     .live-badge {
         background-color: #22c55e; color: white; padding: 5px 10px; 
         border-radius: 12px; font-weight: bold; font-size: 12px; animation: pulse 2s infinite;
     }
     @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
     
-    /* Metrics */
     div[data-testid="metric-container"] {
         background-color: #1e293b; padding: 10px; border-radius: 8px; border: 1px solid #334155;
     }
@@ -84,33 +80,18 @@ def get_email_content(msg):
         except: pass
     return clean_text(body), tokens
 
-# --- 5. STRICT SORTING ENGINE ---
+# --- 5. SORTING LOGIC ---
 def sort_dataframe(df):
     if df.empty: return df
-    
-    # 1. Assign numeric values to priorities
-    # Lower number = Higher spot on list
-    sort_map = {
-        "High": 0, 
-        "Medium": 1, 
-        "Low": 2, 
-        "Unknown": 3
-    }
-    
-    # 2. Create a temporary sort column
-    df['SortRank'] = df['Priority'].map(sort_map)
-    
-    # 3. Sort: First by Rank (Ascending), Then by Time (Descending/Newest)
-    df = df.sort_values(by=['SortRank', 'Time'], ascending=[True, False])
-    
-    # 4. Clean up
-    df = df.drop('SortRank', axis=1)
+    sort_map = {"High": 1, "Medium": 2, "Low": 3, "Unknown": 4}
+    df['SortKey'] = df['Priority'].map(sort_map)
+    df = df.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
     return df
 
 # --- 6. SCANNING LOGIC ---
 def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, metrics_placeholder, status_text):
     try:
-        # Force Port 993 for Cloud Compatibility
+        # Force Port 993
         mail = imaplib.IMAP4_SSL(server, 993)
         mail.login(user, password)
         mail.select("inbox")
@@ -159,7 +140,7 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                         c_s, c_sub, c_b = clean_text(snd), clean_text(sub), clean_text(bod)
                         tok_str = " ".join(toks)
                         
-                        # 3x Amplification Input
+                        # 3x Amplification
                         full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b}"
                         
                         pred = model.predict([full_input])[0]
@@ -174,14 +155,12 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                             "Tokens": toks
                         }
                         
-                        # Add to Data
                         new_df = pd.DataFrame([new_row])
                         st.session_state.data = pd.concat([new_df, st.session_state.data], ignore_index=True)
                         
-                        # --- STRICT SORTING APPLIED HERE ---
+                        # Sort & Render
                         st.session_state.data = sort_dataframe(st.session_state.data)
                         
-                        # Render Updates
                         with table_placeholder.container():
                             render_table(st.session_state.data)
                         with metrics_placeholder.container():
@@ -223,7 +202,7 @@ def render_table(df):
 with st.sidebar:
     st.title("🧠 NeuroMail Live")
     
-    # Auto-Load Logic for Render/HuggingFace
+    # Auto-Load Logic
     model_path = "email_model.pkl"
     uploaded_file = None
     
@@ -256,7 +235,7 @@ with st.sidebar:
             else:
                 st.error("Missing Info")
     
-    # --- NEW DOWNLOAD BUTTON ---
+    # --- ADDED: DOWNLOAD BUTTON ---
     if not st.session_state.data.empty:
         csv = st.session_state.data.to_csv(index=False).encode('utf-8')
         st.download_button(
