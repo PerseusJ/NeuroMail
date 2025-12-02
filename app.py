@@ -1,4 +1,3 @@
-%%writefile app.py
 import streamlit as st
 import imaplib
 import email
@@ -315,3 +314,4 @@ if st.session_state.monitoring:
 
     time.sleep(10)
     st.rerun()
+
