@@ -36,13 +36,49 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. STATE MANAGEMENT ---
-if 'data' not in st.session_state: st.session_state.data = pd.DataFrame()
+# --- 3. PERSISTENCE SYSTEM (The Crash Proofing) ---
+HISTORY_FILE = "scan_history.csv"
+
+def load_history():
+    """Loads previous data from disk to recover from crashes."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            df = pd.read_csv(HISTORY_FILE)
+            return df
+        except:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def save_row_to_disk(row_dict):
+    """Saves a single row instantly to the CSV file."""
+    df = pd.DataFrame([row_dict])
+    # If file doesn't exist, write header. If it does, append without header.
+    header = not os.path.exists(HISTORY_FILE)
+    df.to_csv(HISTORY_FILE, mode='a', header=header, index=False)
+
+def clear_disk_history():
+    """Deletes the physical file."""
+    if os.path.exists(HISTORY_FILE):
+        os.remove(HISTORY_FILE)
+
+# --- 4. STATE INITIALIZATION ---
+if 'data' not in st.session_state:
+    # On startup, try to load history from the file
+    st.session_state.data = load_history()
+    
 if 'monitoring' not in st.session_state: st.session_state.monitoring = False
 if 'seen_emails' not in st.session_state: st.session_state.seen_emails = set()
 if 'last_max_id' not in st.session_state: st.session_state.last_max_id = 0
 
-# --- 4. HELPER FUNCTIONS ---
+# Re-populate 'seen_emails' from loaded history to prevent duplicates after a crash
+if not st.session_state.data.empty:
+    # We create a unique signature for seen emails since we don't save IDs to CSV
+    # Signature: Sender + Subject + Time
+    for index, row in st.session_state.data.iterrows():
+        sig = f"{row['Sender']}_{row['Subject']}_{row['Time']}"
+        st.session_state.seen_emails.add(sig)
+
+# --- 5. HELPER FUNCTIONS ---
 def clean_text(text):
     if text is None: return ""
     if isinstance(text, bytes): text = text.decode(errors='ignore')
@@ -80,7 +116,6 @@ def get_email_content(msg):
         except: pass
     return clean_text(body), tokens
 
-# --- 5. SORTING LOGIC ---
 def sort_dataframe(df):
     if df.empty: return df
     sort_map = {"High": 1, "Medium": 2, "Low": 3, "Unknown": 4}
@@ -91,7 +126,6 @@ def sort_dataframe(df):
 # --- 6. SCANNING LOGIC ---
 def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, metrics_placeholder, status_text):
     try:
-        # Force Port 993
         mail = imaplib.IMAP4_SSL(server, 993)
         mail.login(user, password)
         mail.select("inbox")
@@ -123,7 +157,6 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
             return
 
         status_text.markdown(f"**Found {len(ids_to_process)} new emails.** Sorting and Processing...")
-        
         label_map = {0: "Low", 1: "Medium", 2: "High"}
 
         for i, e_id_int in enumerate(ids_to_process):
@@ -140,14 +173,22 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                         c_s, c_sub, c_b = clean_text(snd), clean_text(sub), clean_text(bod)
                         tok_str = " ".join(toks)
                         
-                        # 3x Amplification
-                        full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b}"
+                        # Deduplication Check (Using Signature because IDs change between sessions)
+                        current_time = datetime.datetime.now().strftime("%H:%M")
+                        sig = f"{c_s}_{c_sub}_{current_time}"
                         
+                        if sig in st.session_state.seen_emails:
+                            continue
+                        
+                        st.session_state.seen_emails.add(sig)
+
+                        # AI Prediction
+                        full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b}"
                         pred = model.predict([full_input])[0]
                         prob = max(model.predict_proba([full_input])[0])
                         
                         new_row = {
-                            "Time": datetime.datetime.now().strftime("%H:%M"),
+                            "Time": current_time,
                             "Priority": label_map.get(pred, "Unknown"),
                             "Confidence": prob,
                             "Sender": c_s,
@@ -155,10 +196,12 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                             "Tokens": toks
                         }
                         
+                        # 1. SAVE TO DISK (The Safety Net)
+                        save_row_to_disk(new_row)
+
+                        # 2. UPDATE UI
                         new_df = pd.DataFrame([new_row])
                         st.session_state.data = pd.concat([new_df, st.session_state.data], ignore_index=True)
-                        
-                        # Sort & Render
                         st.session_state.data = sort_dataframe(st.session_state.data)
                         
                         with table_placeholder.container():
@@ -229,25 +272,22 @@ with st.sidebar:
         if st.button("🟢 START"):
             if email_user and email_pass:
                 st.session_state.monitoring = True
-                st.session_state.seen_emails = set()
+                # Do NOT reset data here, so we keep history
                 st.session_state.last_max_id = 0
                 st.rerun()
             else:
                 st.error("Missing Info")
     
-    # --- ADDED: DOWNLOAD BUTTON ---
+    # DOWNLOAD BUTTON
     if not st.session_state.data.empty:
         csv = st.session_state.data.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="💾 Download Report",
-            data=csv,
-            file_name="email_report.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+        st.download_button("💾 Download Report", data=csv, file_name="email_report.csv", mime="text/csv", use_container_width=True)
     
-    if st.button("Clear History"):
+    # HARD RESET BUTTON
+    if st.button("🗑️ Delete All History"):
+        clear_disk_history()
         st.session_state.data = pd.DataFrame()
+        st.session_state.seen_emails = set()
         st.rerun()
 
 # --- 8. MAIN LAYOUT ---
@@ -265,7 +305,7 @@ if not st.session_state.data.empty:
     with table_placeholder.container():
         render_table(st.session_state.data)
 else:
-    table_placeholder.info("Datasheet empty. Start scanning to populate.")
+    table_placeholder.info("Waiting for scan...")
 
 # --- 9. LOOP ---
 if st.session_state.monitoring:
