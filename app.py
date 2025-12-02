@@ -1,3 +1,4 @@
+%%writefile app.py
 import streamlit as st
 import imaplib
 import email
@@ -22,26 +23,46 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600&display=swap');
     .stApp { background-color: #0e1117; color: #fafafa; font-family: 'Inter', sans-serif; }
-    
-    /* Sidebar */
     section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
     
-    /* Metrics */
-    div[data-testid="metric-container"] {
-        background-color: #1e293b; padding: 10px; border-radius: 8px; border: 1px solid #334155;
-    }
-
-    /* Live Badge Animation */
     .live-badge {
         background-color: #22c55e; color: white; padding: 5px 10px; 
         border-radius: 12px; font-weight: bold; font-size: 12px; animation: pulse 2s infinite;
     }
     @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    
+    div[data-testid="metric-container"] {
+        background-color: #1e293b; padding: 10px; border-radius: 8px; border: 1px solid #334155;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. STATE MANAGEMENT ---
-if 'data' not in st.session_state: st.session_state.data = pd.DataFrame()
+# --- 3. AUTO-RECOVERY SYSTEM ---
+HISTORY_FILE = "scan_history.csv"
+
+def load_history():
+    """Loads previous scan data from disk if it exists."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            df = pd.read_csv(HISTORY_FILE)
+            # Rebuild the 'seen_emails' logic based on Sender+Subject+Time to prevent duplicates
+            # (Since CSV doesn't store IMAP IDs, we use this as a proxy)
+            return df
+        except:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def save_row_to_history(row_data):
+    """Appends a single row to the CSV immediately (Crash Proof)."""
+    df = pd.DataFrame([row_data])
+    # Check if file exists to write header or not
+    header = not os.path.exists(HISTORY_FILE)
+    df.to_csv(HISTORY_FILE, mode='a', header=header, index=False, encoding='utf-8-sig')
+
+# --- STATE MANAGEMENT ---
+if 'data' not in st.session_state: 
+    st.session_state.data = load_history() # Load crash recovery data on startup
+    
 if 'monitoring' not in st.session_state: st.session_state.monitoring = False
 if 'seen_emails' not in st.session_state: st.session_state.seen_emails = set()
 if 'last_max_id' not in st.session_state: st.session_state.last_max_id = 0
@@ -84,15 +105,21 @@ def get_email_content(msg):
         except: pass
     return clean_text(body), tokens
 
-# --- 5. CORE LOGIC ---
+# --- 5. SORTING LOGIC ---
+def sort_dataframe(df):
+    if df.empty: return df
+    sort_map = {"High": 1, "Medium": 2, "Low": 3, "Unknown": 4}
+    df['SortKey'] = df['Priority'].map(sort_map)
+    df = df.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
+    return df
+
+# --- 6. SCANNING LOGIC ---
 def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, metrics_placeholder, status_text):
     try:
-        # CONNECT WITH EXPLICIT PORT 993 (Fixes Cloud Firewall Issues)
-        mail = imaplib.IMAP4_SSL(server, 993)
+        mail = imaplib.IMAP4_SSL(server, 993) # Forced Port 993
         mail.login(user, password)
         mail.select("inbox")
         
-        # Search UNREAD
         _, messages = mail.search(None, 'UNSEEN')
         raw_ids = messages[0].split()
         
@@ -101,19 +128,15 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
             mail.logout()
             return
 
-        # Convert to Ints for Math
         email_ids = sorted([int(x) for x in raw_ids], reverse=True)
-        
         ids_to_process = []
 
-        # --- HIGH WATER MARK LOGIC ---
+        # High Water Mark Logic
         if st.session_state.last_max_id == 0:
-            # First run: Take the limit
             ids_to_process = email_ids[:backlog_limit]
             if ids_to_process:
                 st.session_state.last_max_id = max(ids_to_process)
         else:
-            # Subsequent runs: Only take IDs HIGHER than what we saw last time
             ids_to_process = [x for x in email_ids if x > st.session_state.last_max_id]
             if ids_to_process:
                 st.session_state.last_max_id = max(ids_to_process)
@@ -141,7 +164,7 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                         c_s, c_sub, c_b = clean_text(snd), clean_text(sub), clean_text(bod)
                         tok_str = " ".join(toks)
                         
-                        # 3x Amplification Input
+                        # 3x Amplification
                         full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b}"
                         
                         pred = model.predict([full_input])[0]
@@ -153,17 +176,22 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
                             "Confidence": prob,
                             "Sender": c_s,
                             "Subject": c_sub,
-                            "Tokens": toks
+                            "Tokens": toks,
+                            "Content": c_b[:500] # Saving body content now!
                         }
                         
+                        # 1. SAVE TO DISK INSTANTLY (Crash Proofing)
+                        save_row_to_history(new_row)
+
+                        # 2. UPDATE UI
                         new_df = pd.DataFrame([new_row])
                         st.session_state.data = pd.concat([new_df, st.session_state.data], ignore_index=True)
-                        
-                        # Sort & Render
                         st.session_state.data = sort_dataframe(st.session_state.data)
                         
                         with table_placeholder.container():
-                            render_table(st.session_state.data)
+                            # Hide 'Content' from table to keep it clean, but it is saved in CSV
+                            display_df = st.session_state.data.drop(columns=['Content'], errors='ignore')
+                            render_table(display_df)
                         with metrics_placeholder.container():
                             render_metrics(st.session_state.data)
             except Exception:
@@ -173,14 +201,6 @@ def scan_inbox(model, server, user, password, backlog_limit, table_placeholder, 
         
     except Exception as e:
         st.error(f"Connection Error: {e}")
-
-# --- HELPERS ---
-def sort_dataframe(df):
-    if df.empty: return df
-    sort_map = {"High": 1, "Medium": 2, "Low": 3, "Unknown": 4}
-    df['SortKey'] = df['Priority'].map(sort_map)
-    df = df.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
-    return df
 
 def render_metrics(df):
     c1, c2, c3 = st.columns(3)
@@ -207,11 +227,16 @@ def render_table(df):
         hide_index=True
     )
 
-# --- 6. SIDEBAR ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.title("🧠 NeuroMail Live")
     
-    # Auto-Load Logic
+    # Manual Download Button for the History File
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "rb") as f:
+            st.download_button("💾 Download Full Backup", f, file_name="full_email_backup.csv", mime="text/csv")
+    
+    # Auto-Load Brain
     model_path = "email_model.pkl"
     uploaded_file = None
     
@@ -238,18 +263,22 @@ with st.sidebar:
         if st.button("🟢 START"):
             if email_user and email_pass:
                 st.session_state.monitoring = True
-                # Hard Reset for new session
-                st.session_state.seen_emails = set()
-                st.session_state.last_max_id = 0
+                # We do NOT clear history here anymore. 
+                # It will load from CSV automatically.
                 st.rerun()
             else:
-                st.error("Missing Credentials")
+                st.error("Missing Info")
     
-    if st.button("Clear History"):
+    # Hard Reset Button
+    if st.button("🗑️ Delete All History"):
+        if os.path.exists(HISTORY_FILE):
+            os.remove(HISTORY_FILE)
         st.session_state.data = pd.DataFrame()
+        st.session_state.seen_emails = set()
+        st.session_state.last_max_id = 0
         st.rerun()
 
-# --- 7. MAIN LAYOUT ---
+# --- MAIN ---
 st.markdown("## 📡 Live Inbox Monitor")
 
 metrics_placeholder = st.empty()
@@ -262,11 +291,13 @@ table_placeholder = st.empty()
 
 if not st.session_state.data.empty:
     with table_placeholder.container():
-        render_table(st.session_state.data)
+        # Hide Content column from UI, but it exists in the backend
+        display_df = st.session_state.data.drop(columns=['Content'], errors='ignore')
+        render_table(display_df)
 else:
-    table_placeholder.info("Datasheet empty. Start scanning to populate.")
+    table_placeholder.info("History empty. Waiting for scan...")
 
-# --- 8. LOOP ---
+# --- LOOP ---
 if st.session_state.monitoring:
     status_text.markdown('<span class="live-badge">● LIVE: Scanning...</span>', unsafe_allow_html=True)
     
