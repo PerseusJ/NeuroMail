@@ -256,6 +256,17 @@ with st.sidebar:
             else:
                 st.error("Missing Info")
     
+    # --- NEW DOWNLOAD BUTTON ---
+    if not st.session_state.data.empty:
+        csv = st.session_state.data.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="💾 Download Report",
+            data=csv,
+            file_name="email_report.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    
     if st.button("Clear History"):
         st.session_state.data = pd.DataFrame()
         st.rerun()
