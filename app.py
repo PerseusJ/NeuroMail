@@ -189,7 +189,12 @@ def process_single_email(msg, model, e_id_int):
     # Deduplication
     sig = f"{c_s}_{c_sub}_{c_b[:20]}"
     if sig in st.session_state.seen_emails:
-        return None
+        # Return a special sentinel or None to indicate duplicate
+        # But if we return None, the caller thinks it failed.
+        # We need to tell caller "it was duplicate" so it doesn't count as "processed successfully" 
+        # OR we count it as processed but skipped.
+        # User wants 50 NEW scans. So if we skip, we should probably try to fetch more until we get 50.
+        return "DUPLICATE"
 
     # Prediction
     full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b}"
@@ -201,17 +206,13 @@ def process_single_email(msg, model, e_id_int):
         pred = "Unknown"
         prob = 0.0
 
-    # Normalize Label to High/Medium/Low if model returns numeric
-    # Assuming model returns 0, 1, 2 or "Low", "Medium", "High"
     label_map = {0: "Low", 1: "Medium", 2: "High"}
-    
     priority_label = "Unknown"
     if isinstance(pred, int):
         priority_label = label_map.get(pred, "Unknown")
     else:
-        priority_label = str(pred) # Assume it's already a string label if not int
+        priority_label = str(pred)
 
-    # Double-check mapping if model returns numeric string '0', '1', '2'
     if priority_label == '0': priority_label = "Low"
     if priority_label == '1': priority_label = "Medium"
     if priority_label == '2': priority_label = "High"
@@ -223,8 +224,8 @@ def process_single_email(msg, model, e_id_int):
         "Sender": c_s,
         "Subject": c_sub,
         "Tokens": toks,
-        "Content": c_b[:500], # Truncate content for DF
-        "ID": e_id_int # Store ID to help with tracking
+        "Content": c_b[:500],
+        "ID": e_id_int
     }
     
     st.session_state.seen_emails.add(sig)
@@ -250,54 +251,71 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
         # Convert to ints and sort descending (newest first)
         all_ids = sorted([int(x) for x in raw_ids], reverse=True)
         
-        ids_to_process = []
+        # Determine mode
         is_live_update = (st.session_state.last_max_id > 0)
         
+        processed_count = 0
+        target_count = limit if not is_live_update else len(all_ids) # In live mode we just check what's new, but for initial we want 'limit' valid emails
+        
+        # ID Selection
         if is_live_update:
-            # Only check for new mail that arrived since last scan
-            ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
-            if not ids_to_process:
-                 # No new mail
+             # Live Mode: Just take everything newer than last_max_id
+             ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
+             if not ids_to_process:
                  st.session_state.scan_status = "Monitoring (Up to date)"
                  placeholder_status.markdown(f'<div class="live-badge"><div class="dot"></div>LIVE: Monitoring...</div>', unsafe_allow_html=True)
                  mail.logout()
                  return
+             # For live update, we just process what is there
         else:
-            # Initial batch
-            ids_to_process = all_ids[:limit]
-            st.session_state.scan_status = f"Batch Scanning ({len(ids_to_process)} emails)"
-            placeholder_status.info(f"Fetching last {len(ids_to_process)} emails...")
-
-        # Process
+            # Initial Batch Mode:
+            # We need to find 'limit' *unique/new* emails.
+            # We can't just slice all_ids[:limit] because some might be duplicates or errors.
+            # So we iterate until we hit 'limit' successes or run out of IDs.
+            # To be safe, let's grab a larger chunk or iterate.
+            ids_to_process = all_ids # We will iterate through this manually
+            st.session_state.scan_status = f"Batch Scanning (Target: {limit})"
+            placeholder_status.info(f"Scanning for {limit} new emails...")
+        
         new_rows = []
         
-        for i, e_id_int in enumerate(ids_to_process):
-            # Update max_id seen so far
+        for e_id_int in ids_to_process:
+            # Stop if we hit the limit in batch mode
+            if not is_live_update and processed_count >= limit:
+                break
+
+            # Update high water mark
             if e_id_int > st.session_state.last_max_id:
                 st.session_state.last_max_id = e_id_int
             
-            # Fetch
             try:
                 _, msg_data = mail.fetch(str(e_id_int), "(RFC822)")
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
                         msg = email.message_from_bytes(response_part[1])
                         row = process_single_email(msg, model, e_id_int)
+                        
+                        if row == "DUPLICATE":
+                            # It was a duplicate, so we didn't "process a new email"
+                            # Continue loop to find another one to fill the quota
+                            continue
+                        
                         if row:
                             new_rows.append(row)
+                            processed_count += 1
                             
                             # Immediate Session Update
                             temp_df = pd.DataFrame([row])
                             st.session_state.data = pd.concat([temp_df, st.session_state.data], ignore_index=True)
                             
-                            # Sort by Priority (High > Medium > Low) then Time (Newest First)
+                            # Sort
                             sort_map = {"High": 0, "Medium": 1, "Low": 2, "Unknown": 3}
                             st.session_state.data['SortKey'] = st.session_state.data['Priority'].map(sort_map).fillna(3)
                             st.session_state.data = st.session_state.data.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
                             
                             save_history()
                             
-                            # Refresh UI Components - THIS IS CRITICAL FOR LIVE UPDATES
+                            # Update UI
                             with placeholder_metrics.container():
                                 render_metrics()
                             with placeholder_table.container():
@@ -313,6 +331,8 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
         if new_rows:
             if is_live_update:
                 st.toast(f"Found {len(new_rows)} new emails!", icon="📩")
+        elif not is_live_update and processed_count < limit:
+             st.warning(f"Only found {processed_count} valid new emails (checked {len(all_ids)}).")
         
     except Exception as e:
         st.error(f"Connection Error: {e}")
@@ -328,7 +348,6 @@ def render_metrics():
         m = len(df[df['Priority'] == "Medium"])
         l = len(df[df['Priority'] == "Low"])
     
-    # Top Metric Cards
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:#ef4444">{h}</div><div class="metric-label">High Priority</div></div>""", unsafe_allow_html=True)
@@ -362,7 +381,6 @@ def render_table():
 
 # --- 7. MAIN LAYOUT ---
 def main():
-    # Sidebar
     with st.sidebar:
         st.title("🧠 NeuroMail")
         st.caption("AI-Powered Email Intelligence")
@@ -414,17 +432,14 @@ def main():
             csv = st.session_state.data.to_csv(index=False).encode('utf-8')
             st.download_button("💾 Download CSV", csv, "email_report.csv", "text/csv", use_container_width=True)
 
-    # Main Content
     st.title("Live Inbox Monitor")
 
-    # Top Metric Cards
     metrics_placeholder = st.empty()
     with metrics_placeholder.container():
         render_metrics()
     
     st.divider()
     
-    # Live Status
     status_col, _ = st.columns([1, 3])
     status_placeholder = status_col.empty()
     
@@ -433,12 +448,10 @@ def main():
     else:
         status_placeholder.markdown(f'<div style="color: #64748b; font-weight:600">● Inactive</div>', unsafe_allow_html=True)
     
-    # Table
     table_placeholder = st.empty()
     with table_placeholder.container():
         render_table()
 
-    # --- BACKGROUND WORKER ---
     if st.session_state.monitoring and uploaded_file:
         try:
             if isinstance(uploaded_file, str):
