@@ -211,6 +211,11 @@ def process_single_email(msg, model, e_id_int):
     else:
         priority_label = str(pred) # Assume it's already a string label if not int
 
+    # Double-check mapping if model returns numeric string '0', '1', '2'
+    if priority_label == '0': priority_label = "Low"
+    if priority_label == '1': priority_label = "Medium"
+    if priority_label == '2': priority_label = "High"
+
     row = {
         "Time": datetime.datetime.now().strftime("%H:%M:%S"),
         "Priority": priority_label,
@@ -292,7 +297,7 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
                             
                             save_history()
                             
-                            # Refresh UI Components
+                            # Refresh UI Components - THIS IS CRITICAL FOR LIVE UPDATES
                             with placeholder_metrics.container():
                                 render_metrics()
                             with placeholder_table.container():
@@ -331,27 +336,6 @@ def render_metrics():
         st.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:#f59e0b">{m}</div><div class="metric-label">Medium Priority</div></div>""", unsafe_allow_html=True)
     with c3:
         st.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:#3b82f6">{l}</div><div class="metric-label">Low Priority</div></div>""", unsafe_allow_html=True)
-
-def render_mini_metrics():
-    # Helper to show counts below title
-    df = st.session_state.data
-    if df.empty:
-        h, m, l = 0, 0, 0
-    else:
-        h = len(df[df['Priority'] == "High"])
-        m = len(df[df['Priority'] == "Medium"])
-        l = len(df[df['Priority'] == "Low"])
-    
-    st.markdown(
-        f"""
-        <div style="display: flex; gap: 20px; margin-bottom: 10px; font-family: 'JetBrains Mono', monospace; font-size: 14px;">
-            <span style="color: #ef4444;">High: {h}</span>
-            <span style="color: #f59e0b;">Medium: {m}</span>
-            <span style="color: #3b82f6;">Low: {l}</span>
-        </div>
-        """, 
-        unsafe_allow_html=True
-    )
 
 def render_table():
     df = st.session_state.data
@@ -432,11 +416,6 @@ def main():
 
     # Main Content
     st.title("Live Inbox Monitor")
-    
-    # Render Mini Metrics right below title
-    metrics_mini_placeholder = st.empty()
-    with metrics_mini_placeholder.container():
-        render_mini_metrics()
 
     # Top Metric Cards
     metrics_placeholder = st.empty()
@@ -466,18 +445,11 @@ def main():
                 model = joblib.load(uploaded_file)
             else:
                 model = joblib.load(uploaded_file)
-                
-            # Pass mini-metrics placeholder so it updates too if needed (or rely on rerun)
-            # Actually we can update placeholders directly inside the loop
             
             run_scan_cycle(
                 model, imap_server, email_user, email_pass, 
                 scan_limit, metrics_placeholder, table_placeholder, status_placeholder
             )
-            
-            # Force update of mini metrics after cycle
-            with metrics_mini_placeholder.container():
-                render_mini_metrics()
             
             time.sleep(5)
             st.rerun()
