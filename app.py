@@ -201,8 +201,15 @@ def process_single_email(msg, model, e_id_int):
         pred = "Unknown"
         prob = 0.0
 
+    # Normalize Label to High/Medium/Low if model returns numeric
+    # Assuming model returns 0, 1, 2 or "Low", "Medium", "High"
     label_map = {0: "Low", 1: "Medium", 2: "High"}
-    priority_label = label_map.get(pred, pred) if isinstance(pred, int) else pred
+    
+    priority_label = "Unknown"
+    if isinstance(pred, int):
+        priority_label = label_map.get(pred, "Unknown")
+    else:
+        priority_label = str(pred) # Assume it's already a string label if not int
 
     row = {
         "Time": datetime.datetime.now().strftime("%H:%M:%S"),
@@ -226,10 +233,7 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
         mail.login(user, password)
         mail.select("inbox")
 
-        # Search for ALL messages (or just UNSEEN if preferred, but user asked for 'newest')
-        # We usually want to scan the newest N emails regardless of read status if it's the first run,
-        # but let's stick to UNSEEN to avoid reprocessing old read mail, OR fetch everything and rely on seen_emails cache.
-        # Plan: Fetch 'limit' newest emails.
+        # Search for ALL messages
         _, messages = mail.search(None, 'ALL')
         raw_ids = messages[0].split()
         
@@ -240,10 +244,6 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
 
         # Convert to ints and sort descending (newest first)
         all_ids = sorted([int(x) for x in raw_ids], reverse=True)
-        
-        # Determine which IDs to process
-        # If this is the first run or we reset, we look at the top 'limit'
-        # If we are in live mode loop, we only look for IDs > last_max_id
         
         ids_to_process = []
         is_live_update = (st.session_state.last_max_id > 0)
@@ -281,20 +281,18 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
                         if row:
                             new_rows.append(row)
                             
-                            # OPTIONAL: Immediate UI update per email (slower but cooler)
-                            # For batch, maybe update every few? For live, update immediately.
-                            # Let's append to session state immediately for "live" feel
+                            # Immediate Session Update
                             temp_df = pd.DataFrame([row])
                             st.session_state.data = pd.concat([temp_df, st.session_state.data], ignore_index=True)
                             
-                            # Sort: High Priority first, then Time
+                            # Sort by Priority (High > Medium > Low) then Time (Newest First)
                             sort_map = {"High": 0, "Medium": 1, "Low": 2, "Unknown": 3}
                             st.session_state.data['SortKey'] = st.session_state.data['Priority'].map(sort_map).fillna(3)
                             st.session_state.data = st.session_state.data.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
                             
-                            save_history() # Persist
+                            save_history()
                             
-                            # Refresh UI
+                            # Refresh UI Components
                             with placeholder_metrics.container():
                                 render_metrics()
                             with placeholder_table.container():
@@ -325,6 +323,7 @@ def render_metrics():
         m = len(df[df['Priority'] == "Medium"])
         l = len(df[df['Priority'] == "Low"])
     
+    # Top Metric Cards
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:#ef4444">{h}</div><div class="metric-label">High Priority</div></div>""", unsafe_allow_html=True)
@@ -333,13 +332,33 @@ def render_metrics():
     with c3:
         st.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:#3b82f6">{l}</div><div class="metric-label">Low Priority</div></div>""", unsafe_allow_html=True)
 
+def render_mini_metrics():
+    # Helper to show counts below title
+    df = st.session_state.data
+    if df.empty:
+        h, m, l = 0, 0, 0
+    else:
+        h = len(df[df['Priority'] == "High"])
+        m = len(df[df['Priority'] == "Medium"])
+        l = len(df[df['Priority'] == "Low"])
+    
+    st.markdown(
+        f"""
+        <div style="display: flex; gap: 20px; margin-bottom: 10px; font-family: 'JetBrains Mono', monospace; font-size: 14px;">
+            <span style="color: #ef4444;">High: {h}</span>
+            <span style="color: #f59e0b;">Medium: {m}</span>
+            <span style="color: #3b82f6;">Low: {l}</span>
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
+
 def render_table():
     df = st.session_state.data
     if df.empty:
         st.info("No emails scanned yet.")
         return
 
-    # Clean up for display
     display_df = df.drop(columns=['Content', 'ID'], errors='ignore')
     
     st.dataframe(
@@ -366,7 +385,6 @@ def main():
         
         st.markdown("### ⚙️ Configuration")
         
-        # Model Loader
         model_path = "email_model.pkl"
         uploaded_file = None
         if os.path.exists(model_path):
@@ -375,18 +393,14 @@ def main():
         else:
             uploaded_file = st.file_uploader("Upload Model (.pkl)", type="pkl")
 
-        # Credentials
         with st.expander("📧 Email Credentials", expanded=True):
             imap_server = st.selectbox("Provider", ["imap.gmail.com", "outlook.office365.com"])
             email_user = st.text_input("Email Address")
             email_pass = st.text_input("App Password", type="password", help="Use an App Password for Gmail")
         
         st.markdown("---")
-        
-        # Settings
         scan_limit = st.slider("Batch Scan Size (Newest)", 10, 1000, 50)
         
-        # Controls
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🔴 Stop", use_container_width=True):
@@ -419,14 +433,19 @@ def main():
     # Main Content
     st.title("Live Inbox Monitor")
     
-    # Top Metrics Row
+    # Render Mini Metrics right below title
+    metrics_mini_placeholder = st.empty()
+    with metrics_mini_placeholder.container():
+        render_mini_metrics()
+
+    # Top Metric Cards
     metrics_placeholder = st.empty()
     with metrics_placeholder.container():
         render_metrics()
     
     st.divider()
     
-    # Live Status & Table
+    # Live Status
     status_col, _ = st.columns([1, 3])
     status_placeholder = status_col.empty()
     
@@ -435,6 +454,7 @@ def main():
     else:
         status_placeholder.markdown(f'<div style="color: #64748b; font-weight:600">● Inactive</div>', unsafe_allow_html=True)
     
+    # Table
     table_placeholder = st.empty()
     with table_placeholder.container():
         render_table()
@@ -447,13 +467,18 @@ def main():
             else:
                 model = joblib.load(uploaded_file)
                 
-            # Run the cycle
+            # Pass mini-metrics placeholder so it updates too if needed (or rely on rerun)
+            # Actually we can update placeholders directly inside the loop
+            
             run_scan_cycle(
                 model, imap_server, email_user, email_pass, 
                 scan_limit, metrics_placeholder, table_placeholder, status_placeholder
             )
             
-            # Loop interval
+            # Force update of mini metrics after cycle
+            with metrics_mini_placeholder.container():
+                render_mini_metrics()
+            
             time.sleep(5)
             st.rerun()
             
