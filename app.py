@@ -8,6 +8,7 @@ import re
 import time
 import datetime
 import os
+import hashlib
 
 # --- 1. PAGE CONFIG ---
 st.set_page_config(
@@ -113,30 +114,25 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 3. CONSTANTS & STATE ---
-HISTORY_FILE = "scan_history.csv"
 
 if 'data' not in st.session_state:
-    if os.path.exists(HISTORY_FILE):
-        try:
-            st.session_state.data = pd.read_csv(HISTORY_FILE)
-        except:
-            st.session_state.data = pd.DataFrame()
-    else:
-        st.session_state.data = pd.DataFrame()
+    st.session_state.data = pd.DataFrame()
 
 if 'seen_emails' not in st.session_state:
     st.session_state.seen_emails = set()
-    if not st.session_state.data.empty:
-        for _, row in st.session_state.data.iterrows():
-            sig = f"{row.get('Sender')}_{row.get('Subject')}_{str(row.get('Content'))[:20]}"
-            st.session_state.seen_emails.add(sig)
 
 if 'monitoring' not in st.session_state: st.session_state.monitoring = False
 if 'scan_status' not in st.session_state: st.session_state.scan_status = "Idle"
 if 'last_scan_time' not in st.session_state: st.session_state.last_scan_time = None
 if 'last_max_id' not in st.session_state: st.session_state.last_max_id = 0
+if 'current_user' not in st.session_state: st.session_state.current_user = None
 
 # --- 4. HELPER FUNCTIONS ---
+def get_user_history_file(email_address):
+    if not email_address: return None
+    safe_name = hashlib.md5(email_address.strip().lower().encode()).hexdigest()
+    return f"scan_history_{safe_name}.csv"
+
 def clean_text(text):
     if text is None: return ""
     if isinstance(text, bytes): text = text.decode(errors='ignore')
@@ -174,9 +170,10 @@ def get_email_content(msg):
         except: pass
     return clean_text(body), tokens
 
-def save_history():
-    if not st.session_state.data.empty:
-        st.session_state.data.to_csv(HISTORY_FILE, index=False)
+def save_history(user_email):
+    fname = get_user_history_file(user_email)
+    if fname and not st.session_state.data.empty:
+        st.session_state.data.to_csv(fname, index=False)
 
 def process_single_email(msg, model, e_id_int):
     sub = safe_decode_header(msg["Subject"])
@@ -189,11 +186,6 @@ def process_single_email(msg, model, e_id_int):
     # Deduplication
     sig = f"{c_s}_{c_sub}_{c_b[:20]}"
     if sig in st.session_state.seen_emails:
-        # Return a special sentinel or None to indicate duplicate
-        # But if we return None, the caller thinks it failed.
-        # We need to tell caller "it was duplicate" so it doesn't count as "processed successfully" 
-        # OR we count it as processed but skipped.
-        # User wants 50 NEW scans. So if we skip, we should probably try to fetch more until we get 50.
         return "DUPLICATE"
 
     # Prediction
@@ -255,24 +247,16 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
         is_live_update = (st.session_state.last_max_id > 0)
         
         processed_count = 0
-        target_count = limit if not is_live_update else len(all_ids) # In live mode we just check what's new, but for initial we want 'limit' valid emails
         
         # ID Selection
         if is_live_update:
-             # Live Mode: Just take everything newer than last_max_id
              ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
              if not ids_to_process:
                  st.session_state.scan_status = "Monitoring (Up to date)"
                  placeholder_status.markdown(f'<div class="live-badge"><div class="dot"></div>LIVE: Monitoring...</div>', unsafe_allow_html=True)
                  mail.logout()
                  return
-             # For live update, we just process what is there
         else:
-            # Initial Batch Mode:
-            # We need to find 'limit' *unique/new* emails.
-            # We can't just slice all_ids[:limit] because some might be duplicates or errors.
-            # So we iterate until we hit 'limit' successes or run out of IDs.
-            # To be safe, let's grab a larger chunk or iterate.
             ids_to_process = all_ids # We will iterate through this manually
             st.session_state.scan_status = f"Batch Scanning (Target: {limit})"
             placeholder_status.info(f"Scanning for {limit} new emails...")
@@ -296,8 +280,6 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
                         row = process_single_email(msg, model, e_id_int)
                         
                         if row == "DUPLICATE":
-                            # It was a duplicate, so we didn't "process a new email"
-                            # Continue loop to find another one to fill the quota
                             continue
                         
                         if row:
@@ -313,7 +295,7 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
                             st.session_state.data['SortKey'] = st.session_state.data['Priority'].map(sort_map).fillna(3)
                             st.session_state.data = st.session_state.data.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
                             
-                            save_history()
+                            save_history(user)
                             
                             # Update UI
                             with placeholder_metrics.container():
@@ -400,6 +382,27 @@ def main():
             email_user = st.text_input("Email Address")
             email_pass = st.text_input("App Password", type="password", help="Use an App Password for Gmail")
         
+        # --- USER SESSION LOGIC ---
+        if email_user != st.session_state.current_user:
+             # User Changed -> Reset Everything
+             st.session_state.current_user = email_user
+             st.session_state.data = pd.DataFrame()
+             st.session_state.seen_emails = set()
+             st.session_state.last_max_id = 0
+             st.session_state.monitoring = False # Stop monitoring if user switches
+             
+             # Load User Specific File
+             user_file = get_user_history_file(email_user)
+             if user_file and os.path.exists(user_file):
+                 try:
+                     st.session_state.data = pd.read_csv(user_file)
+                     # Re-populate seen cache
+                     for _, row in st.session_state.data.iterrows():
+                         sig = f"{row.get('Sender')}_{row.get('Subject')}_{str(row.get('Content'))[:20]}"
+                         st.session_state.seen_emails.add(sig)
+                 except:
+                     pass
+
         st.markdown("---")
         scan_limit = st.slider("Batch Scan Size (Newest)", 10, 1000, 50)
         
@@ -420,12 +423,17 @@ def main():
                     st.rerun()
 
         st.markdown("---")
+        
+        # Clear History (User Scoped)
         if st.button("🗑️ Clear History", use_container_width=True):
             st.session_state.data = pd.DataFrame()
             st.session_state.seen_emails = set()
             st.session_state.last_max_id = 0
-            if os.path.exists(HISTORY_FILE):
-                os.remove(HISTORY_FILE)
+            
+            if st.session_state.current_user:
+                u_file = get_user_history_file(st.session_state.current_user)
+                if u_file and os.path.exists(u_file):
+                    os.remove(u_file)
             st.rerun()
             
         if not st.session_state.data.empty:
@@ -433,6 +441,11 @@ def main():
             st.download_button("💾 Download CSV", csv, "email_report.csv", "text/csv", use_container_width=True)
 
     st.title("Live Inbox Monitor")
+    
+    if st.session_state.current_user:
+        st.caption(f"Logged in as: {st.session_state.current_user}")
+    else:
+        st.info("Please enter your email address in the sidebar to load your profile.")
 
     metrics_placeholder = st.empty()
     with metrics_placeholder.container():
