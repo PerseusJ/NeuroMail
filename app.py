@@ -9,6 +9,7 @@ import time
 import datetime
 import os
 import hashlib
+import streamlit.components.v1 as components
 
 # --- 1. PAGE CONFIG ---
 st.set_page_config(
@@ -153,22 +154,42 @@ def safe_decode_header(header_value):
     except: return str(header_value)
 
 def get_email_content(msg):
-    body = ""
+    body_text = ""
+    body_html = ""
     tokens = []
+    
     if msg.is_multipart():
         for part in msg.walk():
-            if part.get_content_type() == "text/plain":
-                try: body = part.get_payload(decode=True).decode(errors='ignore')
+            ctype = part.get_content_type()
+            
+            if ctype == "text/plain":
+                try: body_text = part.get_payload(decode=True).decode(errors='ignore')
                 except: pass
+            elif ctype == "text/html":
+                try: body_html = part.get_payload(decode=True).decode(errors='ignore')
+                except: pass
+                
             if part.get_filename():
                 fname = part.get_filename().lower()
                 if ".pdf" in fname: tokens.append("PDF")
-                elif ".jpg" in fname or ".png" in fname: tokens.append("IMG")
+                elif ".jpg" in fname or ".jpeg" in fname or ".png" in fname: tokens.append("IMG")
                 elif "invite" in fname: tokens.append("CALENDAR")
     else:
-        try: body = msg.get_payload(decode=True).decode(errors='ignore')
+        # Not multipart, payload is body
+        try:
+            payload = msg.get_payload(decode=True).decode(errors='ignore')
+            if msg.get_content_type() == "text/html":
+                body_html = payload
+            else:
+                body_text = payload
         except: pass
-    return clean_text(body), tokens
+        
+    # If we found HTML but no Text, use HTML as text (cleaned) for classification
+    # If we found Text but no HTML, simple.
+    
+    final_text_for_model = clean_text(body_text) if body_text else clean_text(re.sub('<[^<]+?>', '', body_html))
+    
+    return final_text_for_model, body_text, body_html, tokens
 
 def save_history(user_email):
     fname = get_user_history_file(user_email)
@@ -178,18 +199,20 @@ def save_history(user_email):
 def process_single_email(msg, model, e_id_int):
     sub = safe_decode_header(msg["Subject"])
     snd = str(msg.get("From")).replace("<", "").replace(">", "")
-    bod, toks = get_email_content(msg)
     
-    c_s, c_sub, c_b = clean_text(snd), clean_text(sub), clean_text(bod)
+    # Extract content (Text for Model, HTML for Display)
+    c_b_model, body_plain, body_html, toks = get_email_content(msg)
+    
+    c_s, c_sub = clean_text(snd), clean_text(sub)
     tok_str = " ".join(toks)
     
     # Deduplication
-    sig = f"{c_s}_{c_sub}_{c_b[:20]}"
+    sig = f"{c_s}_{c_sub}_{c_b_model[:20]}"
     if sig in st.session_state.seen_emails:
         return "DUPLICATE"
 
     # Prediction
-    full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b}"
+    full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b_model}"
     try:
         pred = model.predict([full_input])[0]
         prob = max(model.predict_proba([full_input])[0])
@@ -216,7 +239,9 @@ def process_single_email(msg, model, e_id_int):
         "Sender": c_s,
         "Subject": c_sub,
         "Tokens": toks,
-        "Content": c_b[:500],
+        "Content": c_b_model[:500], # Short snippet for legacy/debug
+        "ContentFull": body_plain,  # Full Plain Text
+        "ContentHtml": body_html,   # Full HTML
         "ID": e_id_int
     }
     
@@ -224,7 +249,7 @@ def process_single_email(msg, model, e_id_int):
     return row
 
 # --- 5. SCANNING LOGIC ---
-def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, placeholder_table, placeholder_status):
+def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, placeholder_table, placeholder_status, placeholder_detail):
     try:
         # Connect
         mail = imaplib.IMAP4_SSL(server, 993)
@@ -300,8 +325,11 @@ def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, pl
                             # Update UI
                             with placeholder_metrics.container():
                                 render_metrics()
+                            # Table needs to handle selection state carefully in loop, 
+                            # but usually st.data_editor is interactive.
+                            # We just redraw the table for new rows.
                             with placeholder_table.container():
-                                render_table()
+                                render_table_with_selection()
                                 
             except Exception as e:
                 print(f"Error processing email {e_id_int}: {e}")
@@ -338,16 +366,18 @@ def render_metrics():
     with c3:
         st.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:#3b82f6">{l}</div><div class="metric-label">Low Priority</div></div>""", unsafe_allow_html=True)
 
-def render_table():
+def render_table_with_selection():
     df = st.session_state.data
     if df.empty:
         st.info("No emails scanned yet.")
-        return
+        return None
 
-    display_df = df.drop(columns=['Content', 'ID'], errors='ignore')
+    # Hide bulky columns
+    table_df = df.drop(columns=['ContentFull', 'ContentHtml', 'Content', 'ID'], errors='ignore')
     
-    st.dataframe(
-        display_df,
+    # Interactive Table
+    selected_rows = st.dataframe(
+        table_df,
         column_order=("Priority", "Confidence", "Time", "Sender", "Subject", "Tokens"),
         column_config={
             "Priority": st.column_config.TextColumn(width="small"),
@@ -358,8 +388,61 @@ def render_table():
         },
         use_container_width=True,
         hide_index=True,
-        height=500
+        height=400,
+        selection_mode="single-row",
+        on_select="rerun" 
     )
+    
+    # Return the index of the selected row if any
+    if selected_rows and len(selected_rows.selection.rows) > 0:
+        return selected_rows.selection.rows[0]
+    return None
+
+def render_detail_panel(selected_idx):
+    if selected_idx is None:
+        st.info("Select an email from the list to view details.")
+        return
+
+    # Retrieve row
+    try:
+        # iloc works on position, assuming index hasn't been messed with or we use reset_index
+        # st.dataframe selection returns row index relative to displayed dataframe.
+        # We displayed st.session_state.data directly (just dropped cols).
+        # So the index should match.
+        row = st.session_state.data.iloc[selected_idx]
+    except:
+        st.warning("Selection out of sync. Please re-select.")
+        return
+
+    st.markdown("### 📧 Email Content")
+    
+    # Header Info
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.markdown(f"**Subject:** {row['Subject']}")
+        st.markdown(f"**From:** {row['Sender']}")
+    with c2:
+        st.caption(f"Time: {row['Time']}")
+        st.caption(f"Priority: {row['Priority']}")
+
+    st.divider()
+
+    # Body Content
+    # Prefer HTML if available, else Plain Text
+    html_content = row.get("ContentHtml")
+    plain_content = row.get("ContentFull")
+    
+    # If NaN/None, treat as empty string
+    if pd.isna(html_content): html_content = ""
+    if pd.isna(plain_content): plain_content = ""
+
+    if html_content:
+        # Render HTML in a secure iframe
+        components.html(html_content, height=600, scrolling=True)
+    elif plain_content:
+        st.text_area("Message Body", plain_content, height=400)
+    else:
+        st.caption("No content available.")
 
 # --- 7. MAIN LAYOUT ---
 def main():
@@ -437,7 +520,9 @@ def main():
             st.rerun()
             
         if not st.session_state.data.empty:
-            csv = st.session_state.data.to_csv(index=False).encode('utf-8')
+            # Do not include raw HTML in export unless requested, keep it light
+            export_df = st.session_state.data.drop(columns=['ContentHtml', 'ContentFull'], errors='ignore')
+            csv = export_df.to_csv(index=False).encode('utf-8')
             st.download_button("💾 Download CSV", csv, "email_report.csv", "text/csv", use_container_width=True)
 
     st.title("Live Inbox Monitor")
@@ -461,10 +546,20 @@ def main():
     else:
         status_placeholder.markdown(f'<div style="color: #64748b; font-weight:600">● Inactive</div>', unsafe_allow_html=True)
     
+    # --- SELECTABLE TABLE ---
     table_placeholder = st.empty()
+    selected_row_idx = None
     with table_placeholder.container():
-        render_table()
+        selected_row_idx = render_table_with_selection()
 
+    st.markdown("---")
+    
+    # --- DETAIL PANEL ---
+    detail_placeholder = st.empty()
+    with detail_placeholder.container():
+        render_detail_panel(selected_row_idx)
+
+    # --- BACKGROUND WORKER ---
     if st.session_state.monitoring and uploaded_file:
         try:
             if isinstance(uploaded_file, str):
@@ -474,7 +569,7 @@ def main():
             
             run_scan_cycle(
                 model, imap_server, email_user, email_pass, 
-                scan_limit, metrics_placeholder, table_placeholder, status_placeholder
+                scan_limit, metrics_placeholder, table_placeholder, status_placeholder, detail_placeholder
             )
             
             time.sleep(5)
