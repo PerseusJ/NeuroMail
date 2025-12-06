@@ -119,7 +119,8 @@ st.markdown("""
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        height: 70vh;
+        margin-top: -50px; /* Pull up content to counteract default padding */
+        padding-bottom: 50px;
         text-align: center;
     }
     .login-title {
