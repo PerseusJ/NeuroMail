@@ -295,12 +295,31 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
 
         # Connect with XOAUTH2
         # IMAP authenticate command typically expects base64 encoded SASL response
-        auth_str = auth_utils.generate_oauth2_string(user, access_token, base64_encode=True)
+        auth_str = auth_utils.generate_oauth2_string(user, access_token, base64_encode=False)
         
         mail = imaplib.IMAP4_SSL(server, 993)
         # XOAUTH2 requires specific auth mechanism
         # We pass the auth string directly to the authentication method
-        mail.authenticate("XOAUTH2", lambda x: auth_str)
+        # Note: imaplib authenticate() typically handles the base64 encoding if the mechanism expects it, 
+        # but for XOAUTH2 it often expects the raw SASL string or we need to check how imaplib sends it.
+        # Actually, standard imaplib.authenticate('XOAUTH2', ...) usually expects a callable that returns the *unencoded* bytes or string
+        # which it then encodes? Or it expects the encoded string?
+        # Let's try passing the auth string generator which returns it.
+        # If the server rejects "Invalid SASL argument", it often means double encoding or wrong format.
+        # Let's try passing the callable that constructs the string.
+        # BUT for imaplib, the second arg is `authobject` which must be a callable returning the response.
+        
+        # FIX: The XOAUTH2 string format is user=...\x01auth=Bearer ...\x01\x01
+        # It seems imaplib's authenticate helper doesn't auto-encode for custom mechanisms like XOAUTH2 in older versions?
+        # Wait, if we use the lambda, `imaplib` sends the result of the lambda as the initial client response.
+        # If the server requires it base64 encoded, we must return the base64 encoded string.
+        
+        auth_str_encoded = auth_utils.generate_oauth2_string(user, access_token, base64_encode=False)
+        
+        # Try Authenticate with explicit mechanism
+        # Using the standard approach for Gmail/Outlook XOAUTH2 with imaplib
+        # We usually define a helper class or just pass the lambda
+        mail.authenticate('XOAUTH2', lambda x: auth_str_encoded)
         mail.select("inbox")
 
         # Search for UNSEEN messages instead of ALL
