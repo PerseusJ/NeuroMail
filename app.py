@@ -335,18 +335,33 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
         # Convert to ints and sort descending (newest first)
         all_ids = sorted([int(x) for x in raw_ids], reverse=True)
         
-        processed_count = 0
-        ids_to_process = all_ids
+        # Determine mode
+        is_live_update = (st.session_state.last_max_id > 0)
         
-        st.session_state.scan_status = f"Scanning (Found {len(all_ids)} unread)"
+        processed_count = 0
+        ids_to_process = []
+        
+        if not is_live_update:
+             # Initial Batch: Take only top N newest
+             ids_to_process = all_ids[:limit]
+        else:
+             # Live Update: Take everything newer than last max
+             ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
+             
+        if not ids_to_process and is_live_update:
+             st.session_state.scan_status = "Monitoring (Up to date)"
+             mail.logout()
+             return
+
+        st.session_state.scan_status = f"Scanning {len(ids_to_process)} emails..."
         
         new_rows = []
         
         for e_id_int in ids_to_process:
-            # Stop if we hit the limit in batch mode
-            if processed_count >= limit:
-                break
-            
+            # Update high water mark safely
+            if e_id_int > st.session_state.last_max_id:
+                st.session_state.last_max_id = e_id_int
+                
             try:
                 _, msg_data = mail.fetch(str(e_id_int), "(RFC822)")
                 for response_part in msg_data:
