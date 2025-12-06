@@ -1,4 +1,5 @@
 import streamlit as st
+import imaplib
 import email
 from email.header import decode_header
 import joblib
@@ -8,11 +9,6 @@ import time
 import datetime
 import os
 import hashlib
-import base64
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 import streamlit.components.v1 as components
 
 # --- 1. PAGE CONFIG ---
@@ -129,166 +125,10 @@ if 'seen_emails' not in st.session_state:
 if 'monitoring' not in st.session_state: st.session_state.monitoring = False
 if 'scan_status' not in st.session_state: st.session_state.scan_status = "Idle"
 if 'last_scan_time' not in st.session_state: st.session_state.last_scan_time = None
+if 'last_max_id' not in st.session_state: st.session_state.last_max_id = 0
 if 'current_user' not in st.session_state: st.session_state.current_user = None
-if 'google_creds' not in st.session_state: st.session_state.google_creds = None
-if 'oauth_state' not in st.session_state: st.session_state.oauth_state = None
-if 'auth_url' not in st.session_state: st.session_state.auth_url = None
-if 'seen_message_ids' not in st.session_state: st.session_state.seen_message_ids = set()
-if 'auth_error' not in st.session_state: st.session_state.auth_error = None
 
 # --- 4. HELPER FUNCTIONS ---
-def get_client_config():
-    client_id = os.environ.get("GOOGLE_CLIENT_ID")
-    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8501/")
-    
-    if not client_id or not client_secret:
-        return None, redirect_uri
-    
-    config = {
-        "web": {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [redirect_uri]
-        }
-    }
-    return config, redirect_uri
-
-def build_flow(state=None):
-    config, redirect_uri = get_client_config()
-    if not config:
-        return None, redirect_uri
-    
-    scopes = [
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/userinfo.email",
-        "openid"
-    ]
-    
-    flow = Flow.from_client_config(config, scopes=scopes, redirect_uri=redirect_uri)
-    if state:
-        flow.state = state
-    return flow, redirect_uri
-
-def creds_to_dict(creds):
-    return {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": creds.scopes
-    }
-
-def hydrate_creds():
-    cdict = st.session_state.google_creds
-    if not cdict:
-        return None
-    try:
-        creds = Credentials(
-            token=cdict.get("token"),
-            refresh_token=cdict.get("refresh_token"),
-            token_uri=cdict.get("token_uri"),
-            client_id=cdict.get("client_id"),
-            client_secret=cdict.get("client_secret"),
-            scopes=cdict.get("scopes"),
-        )
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            st.session_state.google_creds = creds_to_dict(creds)
-        return creds
-    except Exception as e:
-        st.session_state.auth_error = f"Auth error: {e}"
-        return None
-
-def handle_oauth_callback():
-    query_params = st.experimental_get_query_params()
-    if 'code' in query_params and 'state' in query_params:
-        code = query_params.get('code', [None])[0]
-        state = query_params.get('state', [None])[0]
-        try:
-            flow, _ = build_flow(state=state)
-            if not flow:
-                st.session_state.auth_error = "Missing Google OAuth client config."
-            elif st.session_state.oauth_state and state != st.session_state.oauth_state:
-                st.session_state.auth_error = "OAuth state mismatch. Please try again."
-            else:
-                flow.fetch_token(code=code)
-                creds = flow.credentials
-                st.session_state.google_creds = creds_to_dict(creds)
-                st.session_state.auth_error = None
-        except Exception as e:
-            st.session_state.auth_error = f"OAuth callback failed: {e}"
-        # Clear query params to keep the URL clean
-        st.experimental_set_query_params()
-
-def ensure_auth_url():
-    if st.session_state.auth_url:
-        return st.session_state.auth_url
-    
-    flow, _ = build_flow()
-    if not flow:
-        return None
-    
-    auth_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent"
-    )
-    st.session_state.oauth_state = state
-    st.session_state.auth_url = auth_url
-    return auth_url
-
-def get_gmail_service():
-    creds = hydrate_creds()
-    if not creds:
-        return None
-    try:
-        return build("gmail", "v1", credentials=creds, cache_discovery=False)
-    except Exception as e:
-        st.session_state.auth_error = f"Gmail service error: {e}"
-        return None
-
-def logout_user():
-    st.session_state.google_creds = None
-    st.session_state.auth_url = None
-    st.session_state.oauth_state = None
-    st.session_state.monitoring = False
-    st.session_state.current_user = None
-    st.session_state.data = pd.DataFrame()
-    st.session_state.seen_emails = set()
-    st.session_state.seen_message_ids = set()
-
-def sync_user_profile(service):
-    try:
-        profile = service.users().getProfile(userId='me').execute()
-        email_addr = profile.get("emailAddress")
-    except Exception:
-        email_addr = None
-    
-    if not email_addr:
-        return
-    
-    if email_addr != st.session_state.current_user:
-        # User switched -> reset data
-        st.session_state.current_user = email_addr
-        st.session_state.data = pd.DataFrame()
-        st.session_state.seen_emails = set()
-        st.session_state.seen_message_ids = set()
-        
-        user_file = get_user_history_file(email_addr)
-        if user_file and os.path.exists(user_file):
-            try:
-                st.session_state.data = pd.read_csv(user_file)
-                for _, row in st.session_state.data.iterrows():
-                    sig = f"{row.get('Sender')}_{row.get('Subject')}_{str(row.get('Content'))[:20]}"
-                    st.session_state.seen_emails.add(sig)
-                    if row.get('ID'):
-                        st.session_state.seen_message_ids.add(str(row.get('ID')))
-            except:
-                pass
 def get_user_history_file(email_address):
     if not email_address: return None
     safe_name = hashlib.md5(email_address.strip().lower().encode()).hexdigest()
@@ -409,70 +249,103 @@ def process_single_email(msg, model, e_id_int):
     return row
 
 # --- 5. SCANNING LOGIC ---
-def run_scan_cycle(model, service, user_email, limit, placeholder_metrics, placeholder_table, placeholder_status, placeholder_detail):
-    if not service:
-        st.session_state.scan_status = "Not authenticated"
-        return
-    
+def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, placeholder_table, placeholder_status, placeholder_detail):
     try:
-        st.session_state.scan_status = f"Scanning latest {limit} emails"
-        placeholder_status.info(f"Scanning latest {limit} emails...")
+        # Connect
+        mail = imaplib.IMAP4_SSL(server, 993)
+        mail.login(user, password)
+        mail.select("inbox")
+
+        # Search for ALL messages
+        _, messages = mail.search(None, 'ALL')
+        raw_ids = messages[0].split()
         
-        resp = service.users().messages().list(userId="me", maxResults=limit).execute()
-        ids_to_process = [m.get("id") for m in resp.get("messages", [])] if resp else []
-        
-        if not ids_to_process:
+        if not raw_ids:
             st.session_state.scan_status = "Inbox Empty"
+            mail.logout()
             return
+
+        # Convert to ints and sort descending (newest first)
+        all_ids = sorted([int(x) for x in raw_ids], reverse=True)
+        
+        # Determine mode
+        is_live_update = (st.session_state.last_max_id > 0)
+        
+        processed_count = 0
+        
+        # ID Selection
+        if is_live_update:
+             ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
+             if not ids_to_process:
+                 st.session_state.scan_status = "Monitoring (Up to date)"
+                 placeholder_status.markdown(f'<div class="live-badge"><div class="dot"></div>LIVE: Monitoring...</div>', unsafe_allow_html=True)
+                 mail.logout()
+                 return
+        else:
+            ids_to_process = all_ids # We will iterate through this manually
+            st.session_state.scan_status = f"Batch Scanning (Target: {limit})"
+            placeholder_status.info(f"Scanning for {limit} new emails...")
         
         new_rows = []
         
-        for msg_id in ids_to_process:
-            if msg_id in st.session_state.seen_message_ids:
-                continue
+        for e_id_int in ids_to_process:
+            # Stop if we hit the limit in batch mode
+            if not is_live_update and processed_count >= limit:
+                break
+
+            # Update high water mark
+            if e_id_int > st.session_state.last_max_id:
+                st.session_state.last_max_id = e_id_int
             
             try:
-                msg_data = service.users().messages().get(userId="me", id=msg_id, format="raw").execute()
-                raw_email = base64.urlsafe_b64decode(msg_data.get("raw", ""))
-                msg = email.message_from_bytes(raw_email)
-                row = process_single_email(msg, model, msg_id)
-                
-                if row == "DUPLICATE":
-                    st.session_state.seen_message_ids.add(msg_id)
-                    continue
-                
-                if row:
-                    new_rows.append(row)
-                    st.session_state.seen_message_ids.add(msg_id)
-                    
-                    temp_df = pd.DataFrame([row])
-                    st.session_state.data = pd.concat([temp_df, st.session_state.data], ignore_index=True)
-                    
-                    sort_map = {"High": 0, "Medium": 1, "Low": 2, "Unknown": 3}
-                    st.session_state.data['SortKey'] = st.session_state.data['Priority'].map(sort_map).fillna(3)
-                    st.session_state.data = st.session_state.data.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
-                    
-                    save_history(user_email)
-                    
-                    with placeholder_metrics.container():
-                        render_metrics()
-                    with placeholder_table.container():
-                        render_table_with_selection()
+                _, msg_data = mail.fetch(str(e_id_int), "(RFC822)")
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
+                        row = process_single_email(msg, model, e_id_int)
                         
+                        if row == "DUPLICATE":
+                            continue
+                        
+                        if row:
+                            new_rows.append(row)
+                            processed_count += 1
+                            
+                            # Immediate Session Update
+                            temp_df = pd.DataFrame([row])
+                            st.session_state.data = pd.concat([temp_df, st.session_state.data], ignore_index=True)
+                            
+                            # Sort
+                            sort_map = {"High": 0, "Medium": 1, "Low": 2, "Unknown": 3}
+                            st.session_state.data['SortKey'] = st.session_state.data['Priority'].map(sort_map).fillna(3)
+                            st.session_state.data = st.session_state.data.sort_values(by=['SortKey', 'Time'], ascending=[True, False]).drop('SortKey', axis=1)
+                            
+                            save_history(user)
+                            
+                            # Update UI
+                            with placeholder_metrics.container():
+                                render_metrics()
+                            # Table needs to handle selection state carefully in loop, 
+                            # but usually st.data_editor is interactive.
+                            # We just redraw the table for new rows.
+                            with placeholder_table.container():
+                                render_table_with_selection()
+                                
             except Exception as e:
-                print(f"Error processing Gmail message {msg_id}: {e}")
+                print(f"Error processing email {e_id_int}: {e}")
                 continue
-        
+
+        mail.logout()
         st.session_state.last_scan_time = datetime.datetime.now()
         
         if new_rows:
-            st.toast(f"Found {len(new_rows)} new emails!", icon="📩")
-        else:
-            st.session_state.scan_status = "Monitoring (Up to date)"
-            placeholder_status.markdown(f'<div class="live-badge"><div class="dot"></div>LIVE: Monitoring...</div>', unsafe_allow_html=True)
+            if is_live_update:
+                st.toast(f"Found {len(new_rows)} new emails!", icon="📩")
+        elif not is_live_update and processed_count < limit:
+             st.warning(f"Only found {processed_count} valid new emails (checked {len(all_ids)}).")
         
     except Exception as e:
-        st.error(f"Gmail Error: {e}")
+        st.error(f"Connection Error: {e}")
         st.session_state.monitoring = False
 
 # --- 6. UI COMPONENTS ---
@@ -573,12 +446,6 @@ def render_detail_panel(selected_idx):
 
 # --- 7. MAIN LAYOUT ---
 def main():
-    handle_oauth_callback()
-    
-    service = get_gmail_service()
-    if service:
-        sync_user_profile(service)
-    
     with st.sidebar:
         st.title("🧠 NeuroMail")
         st.caption("AI-Powered Email Intelligence")
@@ -593,31 +460,34 @@ def main():
         else:
             uploaded_file = st.file_uploader("Upload Model (.pkl)", type="pkl")
 
-        st.markdown("### 🔐 Google Login")
-        client_config, redirect_uri = get_client_config()
-        if not client_config:
-            st.error("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to enable login.")
-            st.caption(f"Redirect URI (default): {redirect_uri}")
-        else:
-            if st.session_state.auth_error:
-                st.error(st.session_state.auth_error)
-            if not st.session_state.google_creds:
-                auth_url = ensure_auth_url()
-                if auth_url:
-                    st.markdown(f'<a href="{auth_url}" target="_self" style="display:block;padding:10px 14px;text-align:center;background:#0f172a;border:1px solid #334155;border-radius:10px;color:#f8fafc;text-decoration:none;font-weight:700;">Continue with Google</a>', unsafe_allow_html=True)
-                    st.caption(f"Redirect URI: {redirect_uri}")
-                else:
-                    st.warning("Unable to generate Google login link. Check credentials.")
-            else:
-                logged_email = st.session_state.current_user or "Google user"
-                st.success(f"Logged in as {logged_email}", icon="✅")
-                if st.button("Logout", use_container_width=True):
-                    logout_user()
-                    st.experimental_set_query_params()
-                    st.rerun()
+        with st.expander("📧 Email Credentials", expanded=True):
+            imap_server = st.selectbox("Provider", ["imap.gmail.com", "outlook.office365.com"])
+            email_user = st.text_input("Email Address")
+            email_pass = st.text_input("App Password", type="password", help="Use an App Password for Gmail")
+        
+        # --- USER SESSION LOGIC ---
+        if email_user != st.session_state.current_user:
+             # User Changed -> Reset Everything
+             st.session_state.current_user = email_user
+             st.session_state.data = pd.DataFrame()
+             st.session_state.seen_emails = set()
+             st.session_state.last_max_id = 0
+             st.session_state.monitoring = False # Stop monitoring if user switches
+             
+             # Load User Specific File
+             user_file = get_user_history_file(email_user)
+             if user_file and os.path.exists(user_file):
+                 try:
+                     st.session_state.data = pd.read_csv(user_file)
+                     # Re-populate seen cache
+                     for _, row in st.session_state.data.iterrows():
+                         sig = f"{row.get('Sender')}_{row.get('Subject')}_{str(row.get('Content'))[:20]}"
+                         st.session_state.seen_emails.add(sig)
+                 except:
+                     pass
 
         st.markdown("---")
-        scan_limit = st.slider("Messages to scan (newest first)", 10, 500, 50)
+        scan_limit = st.slider("Batch Scan Size (Newest)", 10, 1000, 50)
         
         col1, col2 = st.columns(2)
         with col1:
@@ -625,16 +495,12 @@ def main():
                 st.session_state.monitoring = False
                 st.rerun()
         with col2:
-            start_btn = st.button(
-                "🟢 Start",
-                use_container_width=True,
-                disabled=not (st.session_state.google_creds and (uploaded_file or os.path.exists(model_path)))
-            )
+            start_btn = st.button("🟢 Start", use_container_width=True)
             if start_btn:
-                if not uploaded_file and not os.path.exists(model_path):
+                if not email_user or not email_pass:
+                    st.error("Credentials required!")
+                elif not uploaded_file:
                     st.error("Model required!")
-                elif not st.session_state.google_creds:
-                    st.error("Google login required!")
                 else:
                     st.session_state.monitoring = True
                     st.rerun()
@@ -645,7 +511,7 @@ def main():
         if st.button("🗑️ Clear History", use_container_width=True):
             st.session_state.data = pd.DataFrame()
             st.session_state.seen_emails = set()
-            st.session_state.seen_message_ids = set()
+            st.session_state.last_max_id = 0
             
             if st.session_state.current_user:
                 u_file = get_user_history_file(st.session_state.current_user)
@@ -664,7 +530,7 @@ def main():
     if st.session_state.current_user:
         st.caption(f"Logged in as: {st.session_state.current_user}")
     else:
-        st.info("Login with Google to begin scanning your Gmail inbox.")
+        st.info("Please enter your email address in the sidebar to load your profile.")
 
     metrics_placeholder = st.empty()
     with metrics_placeholder.container():
@@ -694,20 +560,15 @@ def main():
         render_detail_panel(selected_row_idx)
 
     # --- BACKGROUND WORKER ---
-    if st.session_state.monitoring and (uploaded_file or os.path.exists(model_path)):
+    if st.session_state.monitoring and uploaded_file:
         try:
-            if uploaded_file and not isinstance(uploaded_file, str):
+            if isinstance(uploaded_file, str):
                 model = joblib.load(uploaded_file)
             else:
-                model = joblib.load(model_path)
-            
-            if not service:
-                st.session_state.monitoring = False
-                st.warning("Login required to scan. Please sign in with Google.")
-                return
+                model = joblib.load(uploaded_file)
             
             run_scan_cycle(
-                model, service, st.session_state.current_user, 
+                model, imap_server, email_user, email_pass, 
                 scan_limit, metrics_placeholder, table_placeholder, status_placeholder, detail_placeholder
             )
             
