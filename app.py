@@ -112,6 +112,29 @@ st.markdown("""
         border-radius: 12px;
         overflow: hidden;
     }
+
+    /* Login Screen */
+    .login-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 70vh;
+        text-align: center;
+    }
+    .login-title {
+        font-size: 3rem;
+        font-weight: 800;
+        margin-bottom: 1rem;
+        background: -webkit-linear-gradient(#38bdf8, #818cf8);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .login-subtitle {
+        font-size: 1.2rem;
+        color: #94a3b8;
+        margin-bottom: 3rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -280,46 +303,30 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
         mail.authenticate("XOAUTH2", lambda x: auth_str)
         mail.select("inbox")
 
-        # Search for ALL messages
-        _, messages = mail.search(None, 'ALL')
+        # Search for UNSEEN messages instead of ALL
+        # We use UNSEEN to get only unread messages
+        _, messages = mail.search(None, 'UNSEEN')
         raw_ids = messages[0].split()
         
         if not raw_ids:
-            st.session_state.scan_status = "Inbox Empty"
+            st.session_state.scan_status = "No Unread Emails"
             mail.logout()
             return
 
         # Convert to ints and sort descending (newest first)
         all_ids = sorted([int(x) for x in raw_ids], reverse=True)
         
-        # Determine mode
-        is_live_update = (st.session_state.last_max_id > 0)
-        
         processed_count = 0
+        ids_to_process = all_ids
         
-        # ID Selection
-        if is_live_update:
-             ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
-             if not ids_to_process:
-                 st.session_state.scan_status = "Monitoring (Up to date)"
-                 placeholder_status.markdown(f'<div class="live-badge"><div class="dot"></div>LIVE: Monitoring...</div>', unsafe_allow_html=True)
-                 mail.logout()
-                 return
-        else:
-            ids_to_process = all_ids # We will iterate through this manually
-            st.session_state.scan_status = f"Batch Scanning (Target: {limit})"
-            placeholder_status.info(f"Scanning for {limit} new emails...")
+        st.session_state.scan_status = f"Scanning (Found {len(all_ids)} unread)"
         
         new_rows = []
         
         for e_id_int in ids_to_process:
             # Stop if we hit the limit in batch mode
-            if not is_live_update and processed_count >= limit:
+            if processed_count >= limit:
                 break
-
-            # Update high water mark
-            if e_id_int > st.session_state.last_max_id:
-                st.session_state.last_max_id = e_id_int
             
             try:
                 _, msg_data = mail.fetch(str(e_id_int), "(RFC822)")
@@ -332,6 +339,9 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
                             continue
                         
                         if row:
+                            # Mark as READ (Seen)
+                            mail.store(str(e_id_int), '+FLAGS', '\\Seen')
+                            
                             new_rows.append(row)
                             processed_count += 1
                             
@@ -349,9 +359,6 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
                             # Update UI
                             with placeholder_metrics.container():
                                 render_metrics()
-                            # Table needs to handle selection state carefully in loop, 
-                            # but usually st.data_editor is interactive.
-                            # We just redraw the table for new rows.
                             with placeholder_table.container():
                                 render_table_with_selection()
                                 
@@ -363,9 +370,8 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
         st.session_state.last_scan_time = datetime.datetime.now()
         
         if new_rows:
-            if is_live_update:
-                st.toast(f"Found {len(new_rows)} new emails!", icon="📩")
-        elif not is_live_update and processed_count < limit:
+             st.toast(f"Found {len(new_rows)} new emails!", icon="📩")
+        else:
              st.warning(f"Only found {processed_count} valid new emails (checked {len(all_ids)}).")
         
     except Exception as e:
@@ -468,6 +474,32 @@ def render_detail_panel(selected_idx):
     else:
         st.caption("No content available.")
 
+def render_login_screen():
+    st.markdown('<div class="login-container">', unsafe_allow_html=True)
+    st.markdown('<div class="login-title">🧠 NeuroMail</div>', unsafe_allow_html=True)
+    st.markdown('<div class="login-subtitle">AI-Powered Email Intelligence. Log in to start scanning.</div>', unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col2:
+        # Google Login
+        g_url = auth_utils.get_google_auth_url()
+        if g_url: 
+            st.link_button("Login with Google", g_url, use_container_width=True)
+        else:
+            st.warning("Google credentials missing")
+        
+        st.write("") # Spacer
+
+        # Microsoft Login
+        m_url = auth_utils.get_microsoft_auth_url()
+        if m_url:
+            st.link_button("Login with Microsoft", m_url, use_container_width=True)
+        else:
+            st.warning("Microsoft credentials missing")
+            
+    st.markdown('</div>', unsafe_allow_html=True)
+
 # --- 7. MAIN LAYOUT ---
 def main():
     # --- OAUTH CALLBACK HANDLER ---
@@ -491,7 +523,14 @@ def main():
                 st.rerun()
         except Exception as e:
             st.error(f"Login Error: {e}")
+            st.stop()
 
+    # --- ACCESS GATE ---
+    if not st.session_state.get('oauth_token'):
+        render_login_screen()
+        return
+
+    # --- DASHBOARD (ONLY SHOWN IF LOGGED IN) ---
     with st.sidebar:
         st.title("🧠 NeuroMail")
         st.caption("AI-Powered Email Intelligence")
@@ -506,33 +545,13 @@ def main():
         else:
             uploaded_file = st.file_uploader("Upload Model (.pkl)", type="pkl")
 
-        with st.expander("📧 Login", expanded=True):
-            if not st.session_state.get('oauth_token'):
-                st.markdown("Please log in to scan your emails.")
-                
-                # Google Login
-                g_url = auth_utils.get_google_auth_url()
-                if g_url: 
-                    st.link_button("Login with Google", g_url, use_container_width=True)
-                else:
-                    st.caption("Google credentials not configured.")
-                
-                st.write("") # Spacer
-
-                # Microsoft Login
-                m_url = auth_utils.get_microsoft_auth_url()
-                if m_url:
-                    st.link_button("Login with Microsoft", m_url, use_container_width=True)
-                else:
-                    st.caption("Microsoft credentials not configured.")
-            else:
-                st.success(f"Logged in as: {st.session_state.current_user}")
-                if st.button("Logout", use_container_width=True):
-                    st.session_state.oauth_token = None
-                    st.session_state.current_user = None
-                    st.session_state.data = pd.DataFrame()
-                    st.session_state.monitoring = False
-                    st.rerun()
+        st.success(f"Logged in as: {st.session_state.current_user}")
+        if st.button("Logout", use_container_width=True):
+            st.session_state.oauth_token = None
+            st.session_state.current_user = None
+            st.session_state.data = pd.DataFrame()
+            st.session_state.monitoring = False
+            st.rerun()
 
         # --- USER SESSION LOGIC ---
         if st.session_state.current_user:
@@ -559,9 +578,7 @@ def main():
         with col2:
             start_btn = st.button("🟢 Start", use_container_width=True)
             if start_btn:
-                if not st.session_state.get('oauth_token'):
-                    st.error("Please login first!")
-                elif not uploaded_file:
+                if not uploaded_file:
                     st.error("Model required!")
                 else:
                     st.session_state.monitoring = True
@@ -588,11 +605,7 @@ def main():
             st.download_button("💾 Download CSV", csv, "email_report.csv", "text/csv", use_container_width=True)
 
     st.title("Live Inbox Monitor")
-    
-    if st.session_state.current_user:
-        st.caption(f"Logged in as: {st.session_state.current_user}")
-    else:
-        st.info("Please log in using the sidebar.")
+    st.caption(f"Logged in as: {st.session_state.current_user}")
 
     metrics_placeholder = st.empty()
     with metrics_placeholder.container():
@@ -622,7 +635,7 @@ def main():
         render_detail_panel(selected_row_idx)
 
     # --- BACKGROUND WORKER ---
-    if st.session_state.monitoring and uploaded_file and st.session_state.get('oauth_token'):
+    if st.session_state.monitoring and uploaded_file:
         try:
             if isinstance(uploaded_file, str):
                 model = joblib.load(uploaded_file)
