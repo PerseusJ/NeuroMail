@@ -154,5 +154,6 @@ def refresh_microsoft_token(token_info):
 def generate_oauth2_string(user, token, base64_encode=True):
     auth_string = f"user={user}\x01auth=Bearer {token}\x01\x01"
     if base64_encode:
+        # Standard base64 encoding without newlines
         return base64.b64encode(auth_string.encode("utf-8")).decode("utf-8")
     return auth_string
