@@ -10,6 +10,7 @@ import datetime
 import os
 import hashlib
 import streamlit.components.v1 as components
+import auth_utils
 
 # --- 1. PAGE CONFIG ---
 st.set_page_config(
@@ -127,6 +128,7 @@ if 'scan_status' not in st.session_state: st.session_state.scan_status = "Idle"
 if 'last_scan_time' not in st.session_state: st.session_state.last_scan_time = None
 if 'last_max_id' not in st.session_state: st.session_state.last_max_id = 0
 if 'current_user' not in st.session_state: st.session_state.current_user = None
+if 'oauth_token' not in st.session_state: st.session_state.oauth_token = None
 
 # --- 4. HELPER FUNCTIONS ---
 def get_user_history_file(email_address):
@@ -249,11 +251,33 @@ def process_single_email(msg, model, e_id_int):
     return row
 
 # --- 5. SCANNING LOGIC ---
-def run_scan_cycle(model, server, user, password, limit, placeholder_metrics, placeholder_table, placeholder_status, placeholder_detail):
+def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_table, placeholder_status, placeholder_detail):
     try:
-        # Connect
+        # REFRESH TOKEN LOGIC
+        token_data = st.session_state.get('oauth_token')
+        if not token_data:
+             raise Exception("Not authenticated")
+
+        if token_data['provider'] == 'google':
+            token_data = auth_utils.refresh_google_token(token_data)
+            if not token_data: raise Exception("Token refresh failed")
+            access_token = token_data['token']
+        else:
+            token_data = auth_utils.refresh_microsoft_token(token_data)
+            if not token_data: raise Exception("Token refresh failed")
+            access_token = token_data.get('access_token')
+        
+        # Update session
+        st.session_state['oauth_token'] = token_data
+
+        # Connect with XOAUTH2
+        # IMAP authenticate command typically expects base64 encoded SASL response
+        auth_str = auth_utils.generate_oauth2_string(user, access_token, base64_encode=True)
+        
         mail = imaplib.IMAP4_SSL(server, 993)
-        mail.login(user, password)
+        # XOAUTH2 requires specific auth mechanism
+        # We pass the auth string directly to the authentication method
+        mail.authenticate("XOAUTH2", lambda x: auth_str)
         mail.select("inbox")
 
         # Search for ALL messages
@@ -446,6 +470,28 @@ def render_detail_panel(selected_idx):
 
 # --- 7. MAIN LAYOUT ---
 def main():
+    # --- OAUTH CALLBACK HANDLER ---
+    if 'code' in st.query_params:
+        code = st.query_params['code']
+        state = st.query_params.get('state', 'google')
+        
+        token_data = None
+        try:
+            if state == 'google':
+                token_data = auth_utils.get_google_token_from_code(code)
+            elif state == 'microsoft':
+                token_data = auth_utils.get_microsoft_token_from_code(code)
+            
+            if token_data:
+                st.session_state['oauth_token'] = token_data
+                st.session_state['current_user'] = token_data['email']
+                st.success("Login Successful!")
+                # Reset URL
+                st.query_params.clear()
+                st.rerun()
+        except Exception as e:
+            st.error(f"Login Error: {e}")
+
     with st.sidebar:
         st.title("🧠 NeuroMail")
         st.caption("AI-Powered Email Intelligence")
@@ -460,23 +506,39 @@ def main():
         else:
             uploaded_file = st.file_uploader("Upload Model (.pkl)", type="pkl")
 
-        with st.expander("📧 Email Credentials", expanded=True):
-            imap_server = st.selectbox("Provider", ["imap.gmail.com", "outlook.office365.com"])
-            email_user = st.text_input("Email Address")
-            email_pass = st.text_input("App Password", type="password", help="Use an App Password for Gmail")
-        
+        with st.expander("📧 Login", expanded=True):
+            if not st.session_state.get('oauth_token'):
+                st.markdown("Please log in to scan your emails.")
+                
+                # Google Login
+                g_url = auth_utils.get_google_auth_url()
+                if g_url: 
+                    st.link_button("Login with Google", g_url, use_container_width=True)
+                else:
+                    st.caption("Google credentials not configured.")
+                
+                st.write("") # Spacer
+
+                # Microsoft Login
+                m_url = auth_utils.get_microsoft_auth_url()
+                if m_url:
+                    st.link_button("Login with Microsoft", m_url, use_container_width=True)
+                else:
+                    st.caption("Microsoft credentials not configured.")
+            else:
+                st.success(f"Logged in as: {st.session_state.current_user}")
+                if st.button("Logout", use_container_width=True):
+                    st.session_state.oauth_token = None
+                    st.session_state.current_user = None
+                    st.session_state.data = pd.DataFrame()
+                    st.session_state.monitoring = False
+                    st.rerun()
+
         # --- USER SESSION LOGIC ---
-        if email_user != st.session_state.current_user:
-             # User Changed -> Reset Everything
-             st.session_state.current_user = email_user
-             st.session_state.data = pd.DataFrame()
-             st.session_state.seen_emails = set()
-             st.session_state.last_max_id = 0
-             st.session_state.monitoring = False # Stop monitoring if user switches
-             
+        if st.session_state.current_user:
              # Load User Specific File
-             user_file = get_user_history_file(email_user)
-             if user_file and os.path.exists(user_file):
+             user_file = get_user_history_file(st.session_state.current_user)
+             if user_file and os.path.exists(user_file) and st.session_state.data.empty:
                  try:
                      st.session_state.data = pd.read_csv(user_file)
                      # Re-populate seen cache
@@ -497,8 +559,8 @@ def main():
         with col2:
             start_btn = st.button("🟢 Start", use_container_width=True)
             if start_btn:
-                if not email_user or not email_pass:
-                    st.error("Credentials required!")
+                if not st.session_state.get('oauth_token'):
+                    st.error("Please login first!")
                 elif not uploaded_file:
                     st.error("Model required!")
                 else:
@@ -530,7 +592,7 @@ def main():
     if st.session_state.current_user:
         st.caption(f"Logged in as: {st.session_state.current_user}")
     else:
-        st.info("Please enter your email address in the sidebar to load your profile.")
+        st.info("Please log in using the sidebar.")
 
     metrics_placeholder = st.empty()
     with metrics_placeholder.container():
@@ -560,15 +622,19 @@ def main():
         render_detail_panel(selected_row_idx)
 
     # --- BACKGROUND WORKER ---
-    if st.session_state.monitoring and uploaded_file:
+    if st.session_state.monitoring and uploaded_file and st.session_state.get('oauth_token'):
         try:
             if isinstance(uploaded_file, str):
                 model = joblib.load(uploaded_file)
             else:
                 model = joblib.load(uploaded_file)
             
+            # Determine server based on provider
+            provider = st.session_state.oauth_token['provider']
+            server = "imap.gmail.com" if provider == 'google' else "outlook.office365.com"
+            
             run_scan_cycle(
-                model, imap_server, email_user, email_pass, 
+                model, server, st.session_state.current_user, 
                 scan_limit, metrics_placeholder, table_placeholder, status_placeholder, detail_placeholder
             )
             
