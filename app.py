@@ -11,6 +11,7 @@ import os
 import hashlib
 import streamlit.components.v1 as components
 import auth_utils
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 
 # --- 1. PAGE CONFIG ---
 st.set_page_config(
@@ -153,6 +154,13 @@ if 'last_scan_time' not in st.session_state: st.session_state.last_scan_time = N
 if 'last_max_id' not in st.session_state: st.session_state.last_max_id = 0
 if 'current_user' not in st.session_state: st.session_state.current_user = None
 if 'oauth_token' not in st.session_state: st.session_state.oauth_token = None
+if 'model_obj' not in st.session_state: st.session_state.model_obj = None
+if 'model_kind' not in st.session_state: st.session_state.model_kind = None
+if 'model_label_map' not in st.session_state:
+    st.session_state.model_label_map = {0: "Low", 1: "Medium", 2: "High"}
+
+# Default model directory (for HF zip/unzip artifact)
+MODEL_DIR = os.getenv("MODEL_DIR", "./final_bert_model")
 
 # --- 4. HELPER FUNCTIONS ---
 def get_user_history_file(email_address):
@@ -239,24 +247,33 @@ def process_single_email(msg, model, e_id_int):
 
     # Prediction
     full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b_model}"
-    try:
-        pred = model.predict([full_input])[0]
-        prob = max(model.predict_proba([full_input])[0])
-    except:
-        # Fallback if model fails or no proba
-        pred = "Unknown"
-        prob = 0.0
-
-    label_map = {0: "Low", 1: "Medium", 2: "High"}
     priority_label = "Unknown"
-    if isinstance(pred, int):
-        priority_label = label_map.get(pred, "Unknown")
-    else:
-        priority_label = str(pred)
+    prob = 0.0
 
-    if priority_label == '0': priority_label = "Low"
-    if priority_label == '1': priority_label = "Medium"
-    if priority_label == '2': priority_label = "High"
+    if st.session_state.model_kind == "hf_pipeline":
+        # Hugging Face pipeline returns list of dicts
+        results = model(full_input)[0]
+        results = sorted(results, key=lambda x: x.get("score", 0), reverse=True)
+        top = results[0] if results else {}
+        priority_label = top.get("label", "Unknown")
+        prob = top.get("score", 0.0)
+    else:
+        try:
+            pred = model.predict([full_input])[0]
+            prob = max(model.predict_proba([full_input])[0])
+        except:
+            pred = "Unknown"
+            prob = 0.0
+
+        label_map = st.session_state.model_label_map
+        if isinstance(pred, int):
+            priority_label = label_map.get(pred, "Unknown")
+        else:
+            priority_label = str(pred)
+
+        if priority_label == '0': priority_label = "Low"
+        if priority_label == '1': priority_label = "Medium"
+        if priority_label == '2': priority_label = "High"
 
     row = {
         "Time": datetime.datetime.now().strftime("%H:%M:%S"),
@@ -535,8 +552,36 @@ def render_login_screen():
             
     st.markdown('</div>', unsafe_allow_html=True)
 
+# --- MODEL LOADER ---
+def load_model_once():
+    """Load model into session_state if not already loaded.
+    Priority: HF directory (MODEL_DIR), then local email_model.pkl for backward compat."""
+    if st.session_state.model_obj is not None:
+        return
+
+    # 1) Try Hugging Face directory
+    if os.path.isdir(MODEL_DIR) and os.path.exists(os.path.join(MODEL_DIR, "config.json")):
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+        hf_model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+        clf = pipeline("text-classification", model=hf_model, tokenizer=tokenizer, top_k=None)
+        st.session_state.model_obj = clf
+        st.session_state.model_kind = "hf_pipeline"
+        return
+
+    # 2) Fallback: legacy sklearn pickle
+    legacy_path = "email_model.pkl"
+    if os.path.exists(legacy_path):
+        st.session_state.model_obj = joblib.load(legacy_path)
+        st.session_state.model_kind = "pkl"
+        return
+
+    st.session_state.model_obj = None
+    st.session_state.model_kind = None
+
 # --- 7. MAIN LAYOUT ---
 def main():
+    load_model_once()
+
     # --- OAUTH CALLBACK HANDLER ---
     if 'code' in st.query_params:
         code = st.query_params['code']
@@ -572,13 +617,12 @@ def main():
         
         st.markdown("### ⚙️ Configuration")
         
-        model_path = "email_model.pkl"
-        uploaded_file = None
-        if os.path.exists(model_path):
-            st.success("Model Loaded", icon="✅")
-            uploaded_file = model_path
+        if st.session_state.model_kind == "hf_pipeline":
+            st.success(f"Model Loaded (HF @ {MODEL_DIR})", icon="✅")
+        elif st.session_state.model_kind == "pkl":
+            st.success("Model Loaded (legacy .pkl)", icon="✅")
         else:
-            uploaded_file = st.file_uploader("Upload Model (.pkl)", type="pkl")
+            st.error("No model found. Ensure MODEL_DIR is set or email_model.pkl is present.")
 
         st.success(f"Logged in as: {st.session_state.current_user}")
         if st.button("Logout", use_container_width=True):
@@ -613,8 +657,8 @@ def main():
         with col2:
             start_btn = st.button("🟢 Start", use_container_width=True)
             if start_btn:
-                if not uploaded_file:
-                    st.error("Model required!")
+                if st.session_state.model_obj is None:
+                    st.error("Model required! Ensure MODEL_DIR exists or email_model.pkl is present.")
                 else:
                     st.session_state.monitoring = True
                     st.rerun()
@@ -670,12 +714,9 @@ def main():
         render_detail_panel(selected_row_idx)
 
     # --- BACKGROUND WORKER ---
-    if st.session_state.monitoring and uploaded_file:
+    if st.session_state.monitoring and st.session_state.model_obj:
         try:
-            if isinstance(uploaded_file, str):
-                model = joblib.load(uploaded_file)
-            else:
-                model = joblib.load(uploaded_file)
+            model = st.session_state.model_obj
             
             # Determine server based on provider
             provider = st.session_state.oauth_token['provider']
