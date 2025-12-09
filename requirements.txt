@@ -6,3 +6,7 @@ google-auth-oauthlib
 google-auth
 msal
 requests
+transformers
+torch
+accelerate
+sentencepiece
