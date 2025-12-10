@@ -12,6 +12,7 @@ import hashlib
 import streamlit.components.v1 as components
 import auth_utils
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+import subprocess
 
 # --- 1. PAGE CONFIG ---
 st.set_page_config(
@@ -160,7 +161,34 @@ if 'model_label_map' not in st.session_state:
     st.session_state.model_label_map = {0: "Low", 1: "Medium", 2: "High"}
 
 # Default model directory (for HF zip/unzip artifact)
-MODEL_DIR = os.getenv("MODEL_DIR", "./final_bert_model")
+# Point to the distilled model by default; override via env as needed
+MODEL_DIR = os.getenv("MODEL_DIR", "./final_distilbert_model")
+ASSET_URL = os.getenv(
+    "MODEL_ASSET_URL",
+    "https://github.com/PerseusJ/NeuroMail/releases/download/v1.0/email_model_distilbert.zip"
+)
+
+# --- MODEL ARTIFACT FETCHER ---
+def ensure_model_present():
+    """
+    Ensure the HF model directory exists by downloading/unzipping the release asset if missing.
+    Honors MODEL_DIR and optional GITHUB_TOKEN (for private releases).
+    """
+    config_path = os.path.join(MODEL_DIR, "config.json")
+    if os.path.exists(config_path):
+        return
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    zip_path = "/tmp/model.zip"
+
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        curl_cmd = ["curl", "-L", "-H", f"Authorization: Bearer {token}", ASSET_URL, "-o", zip_path]
+    else:
+        curl_cmd = ["curl", "-L", ASSET_URL, "-o", zip_path]
+
+    subprocess.run(curl_cmd, check=True)
+    subprocess.run(["unzip", "-o", zip_path, "-d", MODEL_DIR], check=True)
 
 # --- 4. HELPER FUNCTIONS ---
 def get_user_history_file(email_address):
@@ -558,6 +586,9 @@ def load_model_once():
     Priority: HF directory (MODEL_DIR), then local email_model.pkl for backward compat."""
     if st.session_state.model_obj is not None:
         return
+
+    # Ensure model artifacts are present (fetch + unzip if missing)
+    ensure_model_present()
 
     # 1) Try Hugging Face directory
     if os.path.isdir(MODEL_DIR) and os.path.exists(os.path.join(MODEL_DIR, "config.json")):
