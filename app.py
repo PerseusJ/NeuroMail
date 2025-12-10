@@ -271,9 +271,9 @@ def process_single_email(msg, model, e_id_int):
         else:
             priority_label = str(pred)
 
-        if priority_label == '0': priority_label = "Low"
-        if priority_label == '1': priority_label = "Medium"
-        if priority_label == '2': priority_label = "High"
+    if priority_label == '0': priority_label = "Low"
+    if priority_label == '1': priority_label = "Medium"
+    if priority_label == '2': priority_label = "High"
 
     row = {
         "Time": datetime.datetime.now().strftime("%H:%M:%S"),
