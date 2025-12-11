@@ -378,19 +378,15 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
         # Convert to ints and sort descending (newest first)
         all_ids = sorted([int(x) for x in raw_ids], reverse=True)
 
-        print(f"DEBUG: Found {len(all_ids)} unread emails. Last max ID: {st.session_state.last_max_id}")
-
         processed_count = 0
         ids_to_process = []
 
         if st.session_state.last_max_id == 0:
              # Initial Batch: Take top N newest
              ids_to_process = all_ids[:limit]
-             print(f"DEBUG: Initial batch mode. Processing top {len(ids_to_process)}.")
         else:
              # Live Update: Take everything newer than last max
              ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
-             print(f"DEBUG: Live update mode. Found {len(ids_to_process)} new emails > {st.session_state.last_max_id}.")
 
         if not ids_to_process:
              # Only idle if truly no new messages (and we aren't in first-run state)
@@ -420,7 +416,6 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
                         row = process_single_email(msg, model, e_id_int)
                         
                         if row == "DUPLICATE":
-                             print(f"DEBUG: Skipped duplicate {e_id_int}")
                              continue
                         
                         if row:
@@ -456,13 +451,12 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
         st.session_state.last_scan_time = datetime.datetime.now()
         
         # Keep monitoring active for new emails
-        # (Removed the forced stop so it stays live)
         
         if new_rows:
              st.toast(f"Found {len(new_rows)} new emails!", icon="📩")
         else:
-             if processed_count == 0 and len(ids_to_process) > 0:
-                 print(f"DEBUG: Processed {len(ids_to_process)} but 0 valid rows added.")
+             # Just update status if nothing valid added
+             pass
         
     except Exception as e:
         st.error(f"Connection Error: {e}")
