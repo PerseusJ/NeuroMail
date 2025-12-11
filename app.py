@@ -434,9 +434,12 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
                 print(f"Error processing email {e_id_int}: {e}")
                 continue
 
-        mail.logout()
+        mail.logout()        
         st.session_state.last_scan_time = datetime.datetime.now()
         
+        # Stop monitoring after one batch unless you want continuous looping
+        st.session_state.monitoring = False
+
         if new_rows:
              st.toast(f"Found {len(new_rows)} new emails!", icon="📩")
         else:
