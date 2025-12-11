@@ -378,14 +378,30 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
         # Convert to ints and sort descending (newest first)
         all_ids = sorted([int(x) for x in raw_ids], reverse=True)
 
-        # Always take the top N newest unread (batch mode), ignoring last_max_id
+        print(f"DEBUG: Found {len(all_ids)} unread emails. Last max ID: {st.session_state.last_max_id}")
+
         processed_count = 0
-        ids_to_process = all_ids[:limit]
+        ids_to_process = []
+
+        if st.session_state.last_max_id == 0:
+             # Initial Batch: Take top N newest
+             ids_to_process = all_ids[:limit]
+             print(f"DEBUG: Initial batch mode. Processing top {len(ids_to_process)}.")
+        else:
+             # Live Update: Take everything newer than last max
+             ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
+             print(f"DEBUG: Live update mode. Found {len(ids_to_process)} new emails > {st.session_state.last_max_id}.")
 
         if not ids_to_process:
-             st.session_state.scan_status = "No Unread Emails"
-             mail.logout()
-             return
+             # Only idle if truly no new messages (and we aren't in first-run state)
+             if st.session_state.last_max_id > 0:
+                 st.session_state.scan_status = "Monitoring (Up to date)"
+                 mail.logout()
+                 return
+             else:
+                 st.session_state.scan_status = "No Unread Emails"
+                 mail.logout()
+                 return
 
         st.session_state.scan_status = f"Scanning {len(ids_to_process)} emails..."
         
@@ -404,7 +420,8 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
                         row = process_single_email(msg, model, e_id_int)
                         
                         if row == "DUPLICATE":
-                            continue
+                             print(f"DEBUG: Skipped duplicate {e_id_int}")
+                             continue
                         
                         if row:
                             # Mark as READ (Seen)
@@ -415,6 +432,7 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
                             
                             # Immediate Session Update
                             temp_df = pd.DataFrame([row])
+                            # Use concat to append, ensuring we keep old rows
                             st.session_state.data = pd.concat([temp_df, st.session_state.data], ignore_index=True)
                             
                             # Sort
@@ -434,16 +452,17 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
                 print(f"Error processing email {e_id_int}: {e}")
                 continue
 
-        mail.logout()        
+        mail.logout()
         st.session_state.last_scan_time = datetime.datetime.now()
         
-        # Stop monitoring after one batch unless you want continuous looping
-        st.session_state.monitoring = False
-
+        # Keep monitoring active for new emails
+        # (Removed the forced stop so it stays live)
+        
         if new_rows:
              st.toast(f"Found {len(new_rows)} new emails!", icon="📩")
         else:
-             st.warning(f"Only found {processed_count} valid new emails (checked {len(all_ids)}).")
+             if processed_count == 0 and len(ids_to_process) > 0:
+                 print(f"DEBUG: Processed {len(ids_to_process)} but 0 valid rows added.")
         
     except Exception as e:
         st.error(f"Connection Error: {e}")
