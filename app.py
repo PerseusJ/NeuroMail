@@ -165,7 +165,7 @@ if 'model_label_map' not in st.session_state:
 MODEL_DIR = os.getenv("MODEL_DIR", "./final_distilbert_model")
 ASSET_URL = os.getenv(
     "MODEL_ASSET_URL",
-    "https://github.com/PerseusJ/NeuroMail/releases/download/v1.0/final_bert_model_quality.zip"
+    "https://github.com/PerseusJ/NeuroMail/releases/download/v1.0/email_model_transformer.zip"
 )
 
 # --- MODEL ARTIFACT FETCHER ---
@@ -377,22 +377,13 @@ def run_scan_cycle(model, server, user, limit, placeholder_metrics, placeholder_
 
         # Convert to ints and sort descending (newest first)
         all_ids = sorted([int(x) for x in raw_ids], reverse=True)
-        
-        # Determine mode
-        is_live_update = (st.session_state.last_max_id > 0)
-        
+
+        # Always take the top N newest unread (batch mode), ignoring last_max_id
         processed_count = 0
-        ids_to_process = []
-        
-        if not is_live_update:
-             # Initial Batch: Take only top N newest
-             ids_to_process = all_ids[:limit]
-        else:
-             # Live Update: Take everything newer than last max
-             ids_to_process = [x for x in all_ids if x > st.session_state.last_max_id]
-             
-        if not ids_to_process and is_live_update:
-             st.session_state.scan_status = "Monitoring (Up to date)"
+        ids_to_process = all_ids[:limit]
+
+        if not ids_to_process:
+             st.session_state.scan_status = "No Unread Emails"
              mail.logout()
              return
 
@@ -688,6 +679,8 @@ def main():
                 if st.session_state.model_obj is None:
                     st.error("Model required! Ensure MODEL_DIR exists or email_model.pkl is present.")
                 else:
+                    # Reset high-water mark so we always fetch newest batch
+                    st.session_state.last_max_id = 0
                     st.session_state.monitoring = True
                     st.rerun()
 
