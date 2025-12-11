@@ -271,8 +271,8 @@ def process_single_email(msg, model, e_id_int):
     # Deduplication removed per user request: show all emails even near-duplicates
     # (previously used sender+subject+body signature)
 
-    # Prediction
-    full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b_model}"
+    # Prediction — align with training input format (sender x3 + subject + body)
+    full_input = f"{c_s} {c_s} {c_s} {c_sub} {c_b_model}"
     priority_label = "Unknown"
     prob = 0.0
 
@@ -774,6 +774,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
