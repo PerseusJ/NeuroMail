@@ -604,7 +604,8 @@ def load_model_once():
     if os.path.isdir(MODEL_DIR) and os.path.exists(os.path.join(MODEL_DIR, "config.json")):
         tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
         hf_model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
-        clf = pipeline("text-classification", model=hf_model, tokenizer=tokenizer, top_k=None)
+        # Ensure input fits the model by truncating; max_length=512 is standard for DistilBERT
+        clf = pipeline("text-classification", model=hf_model, tokenizer=tokenizer, top_k=None, truncation=True, max_length=512)
         st.session_state.model_obj = clf
         st.session_state.model_kind = "hf_pipeline"
         return
