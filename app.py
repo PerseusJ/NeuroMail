@@ -165,7 +165,7 @@ if 'model_label_map' not in st.session_state:
 MODEL_DIR = os.getenv("MODEL_DIR", "./final_distilbert_model")
 ASSET_URL = os.getenv(
     "MODEL_ASSET_URL",
-    "https://github.com/PerseusJ/NeuroMail/releases/download/v1.0/final_bert_model_quality.zip"
+    "https://github.com/PerseusJ/NeuroMail/releases/download/v2.0/final_bert_model_original.zip"
 )
 
 # --- MODEL ARTIFACT FETCHER ---
@@ -774,4 +774,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
