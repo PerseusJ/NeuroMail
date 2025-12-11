@@ -165,7 +165,7 @@ if 'model_label_map' not in st.session_state:
 MODEL_DIR = os.getenv("MODEL_DIR", "./final_distilbert_model")
 ASSET_URL = os.getenv(
     "MODEL_ASSET_URL",
-    "https://github.com/PerseusJ/NeuroMail/releases/download/v1.0/email_model_transformer.zip"
+    "https://github.com/PerseusJ/NeuroMail/releases/download/v1.0/final_bert_model_quality.zip"
 )
 
 # --- MODEL ARTIFACT FETCHER ---
@@ -268,10 +268,8 @@ def process_single_email(msg, model, e_id_int):
     c_s, c_sub = clean_text(snd), clean_text(sub)
     tok_str = " ".join(toks)
     
-    # Deduplication
-    sig = f"{c_s}_{c_sub}_{c_b_model[:20]}"
-    if sig in st.session_state.seen_emails:
-        return "DUPLICATE"
+    # Deduplication removed per user request: show all emails even near-duplicates
+    # (previously used sender+subject+body signature)
 
     # Prediction
     full_input = f"{c_s} {c_s} {c_s} {tok_str} {c_sub} {c_b_model}"
@@ -316,7 +314,6 @@ def process_single_email(msg, model, e_id_int):
         "ID": e_id_int
     }
     
-    st.session_state.seen_emails.add(sig)
     return row
 
 # --- 5. SCANNING LOGIC ---
