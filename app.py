@@ -260,7 +260,8 @@ def save_history(user_email):
 
 def process_single_email(msg, model, e_id_int):
     sub = safe_decode_header(msg["Subject"])
-    snd = str(msg.get("From")).replace("<", "").replace(">", "")
+    snd_raw = msg.get("From", "")
+    snd = safe_decode_header(snd_raw).replace("<", "").replace(">", "")
     
     # Extract content (Text for Model, HTML for Display)
     c_b_model, body_plain, body_html, toks = get_email_content(msg)
@@ -271,8 +272,8 @@ def process_single_email(msg, model, e_id_int):
     # Deduplication removed per user request: show all emails even near-duplicates
     # (previously used sender+subject+body signature)
 
-    # Prediction — align with training input format (sender x3 + subject + body)
-    full_input = f"{c_s} {c_s} {c_s} {c_sub} {c_b_model}"
+    # Prediction — align with training input format (sender + subject + body)
+    full_input = f"{c_s} {c_sub} {c_b_model}"
     priority_label = "Unknown"
     prob = 0.0
 
