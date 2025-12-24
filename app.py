@@ -162,10 +162,10 @@ if 'model_label_map' not in st.session_state:
 
 # Default model directory (for HF zip/unzip artifact)
 # Point to the distilled model by default; override via env as needed
-MODEL_DIR = os.getenv("MODEL_DIR", "./final_distilbert_model")
+MODEL_DIR = os.getenv("MODEL_DIR", "./final_transformer_model")
 ASSET_URL = os.getenv(
     "MODEL_ASSET_URL",
-    "https://github.com/PerseusJ/NeuroMail/releases/download/v1.0/final_bert_model_quality.zip"
+    "https://github.com/PerseusJ/NeuroMail/releases/download/v1.0/email_model_transformer.zip"
 )
 
 # --- MODEL ARTIFACT FETCHER ---
@@ -179,7 +179,9 @@ def ensure_model_present():
         return
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    zip_path = "/tmp/model.zip"
+    
+    # Use a path inside MODEL_DIR for Windows compatibility
+    zip_path = os.path.join(MODEL_DIR, "model.zip")
 
     token = os.getenv("GITHUB_TOKEN")
     if token:
@@ -188,7 +190,15 @@ def ensure_model_present():
         curl_cmd = ["curl", "-L", ASSET_URL, "-o", zip_path]
 
     subprocess.run(curl_cmd, check=True)
-    subprocess.run(["unzip", "-o", zip_path, "-d", MODEL_DIR], check=True)
+    
+    # Use python's built-in zipfile for cross-platform support (Windows doesn't have 'unzip' by default)
+    import zipfile
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(MODEL_DIR)
+        
+    # Clean up the zip file
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
 
 # --- 4. HELPER FUNCTIONS ---
 def get_user_history_file(email_address):
